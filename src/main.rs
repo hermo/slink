@@ -169,7 +169,14 @@ impl Config {
         } else {
             let content = fs::read_to_string(&config_path)
                 .map_err(|e| anyhow!("Failed to read config file {}: {}", config_path.display(), e))?;
-            Ok(toml::from_str(&content)?)
+            let config:Config = toml::from_str(&content)?;
+
+            if !Path::new(&config.db_path).join("shares.db").exists() {
+                // Try to initialize database
+                init_database(&config.db_path)
+                    .map_err(|e| anyhow!("Failed to initialize database {}: {}", config.db_path, e))?;
+            }
+            Ok(config)
         }
     }
 }

@@ -24,7 +24,7 @@ slink is a self-hosted file sharing utility written in Rust that enables secure 
 
 Core functionality:
 - Files are stored with UUIDs in a base directory (e.g., /var/www/UUID/filename)
-- Sharing links are created using HMAC-SHA256 of UUID + recipient identifier
+- Sharing links are created using keyed BLAKE3 of UUID + recipient identifier
 - File and share information is tracked in SQLite
 - Configuration stored in ~/.config/slink/slink.conf (TOML format)
 - Runs on the server side, managing files directly
@@ -39,16 +39,16 @@ Command interface:
 
 File structure:
 - Original file: BASE_DIR/UUID/filename
-- Share links: BASE_DIR/HMAC_HASH -> UUID (relative symlink)
+- Share links: BASE_DIR/HASH -> UUID (relative symlink)
 
 URL format:
 - Private: https://domain/UUID/filename
-- Shared: https://domain/HMAC_HASH/filename
+- Shared: https://domain/HASH/filename
 
 Security considerations:
 - Runs as dedicated user with appropriate permissions
 - Web server must follow symlinks
-- HMAC secret stored in config
+- BLAKE3 secret stored in config
 - Share history maintained in SQLite
 
 Database schema:

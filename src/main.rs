@@ -232,29 +232,60 @@ fn set_permissions_recursive(
     web_group: &str,
 ) -> Result<()> {
     // Resolve the user and group IDs
-    let uid = users::get_user_by_name(web_user)
+    let web_uid = users::get_user_by_name(web_user)
         .ok_or_else(|| anyhow::anyhow!("User {} not found", web_user))?
         .uid();
-    let gid = users::get_group_by_name(web_group)
+    let web_gid = users::get_group_by_name(web_group)
         .ok_or_else(|| anyhow::anyhow!("Group {} not found", web_group))?
         .gid();
 
+    // Get current user's UID and primary GID
+    let current_uid = nix::unistd::getuid();
+    let current_gid = nix::unistd::getgid();
+
     if path.is_dir() {
-        // Set directory permissions and ownership
-        set_permissions(path, Permissions::from_mode(dir_mode))?;
-        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+        // Set directory permissions to allow owner access first
+        set_permissions(path, Permissions::from_mode(0o700))?;
+
+        // Change ownership to current user temporarily
+        chown(path, Some(current_uid), Some(current_gid))?;
 
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             set_permissions_recursive(&entry.path(), dir_mode, file_mode, web_user, web_group)?;
         }
+
+        // Now set final permissions and ownership
+        set_permissions(path, Permissions::from_mode(dir_mode))?;
+        chown(path, Some(Uid::from_raw(web_uid)), Some(Gid::from_raw(web_gid)))?;
     } else {
-        // Set file permissions and ownership
+        // For files, temporarily make them fully accessible to owner
+        set_permissions(path, Permissions::from_mode(0o600))?;
+        chown(path, Some(current_uid), Some(current_gid))?;
+
+        // Set final permissions and ownership
         set_permissions(path, Permissions::from_mode(file_mode))?;
-        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+        chown(path, Some(Uid::from_raw(web_uid)), Some(Gid::from_raw(web_gid)))?;
     }
     Ok(())
 }
+
+fn remove_file_with_access(path: &Path) -> Result<()> {
+    // Get current user's UID and GID
+    let current_uid = nix::unistd::getuid();
+    let current_gid = nix::unistd::getgid();
+
+    // Temporarily take ownership and full permissions
+    chown(path, Some(current_uid), Some(current_gid))?;
+    set_permissions(path, Permissions::from_mode(0o700))?;
+
+    if path.is_dir() {
+        remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }.map_err(Into::into)
+}
+
 
 impl FileShare {
     fn add(conn: &Connection, config: &Config, file_path: &str) -> Result<String> {
@@ -318,41 +349,42 @@ impl FileShare {
     }
 
     fn remove(&self, conn: &Connection, config: &Config, force: bool) -> Result<()> {
-        if !force {
-            print!("Are you sure you want to remove {}? [y/N] ", self.filename);
-            io::stdout().flush()?;
-            let mut input = String::new();
-            io::stdin().read_line(&mut input)?;
-            if !input.trim().eq_ignore_ascii_case("y") {
-                return Ok(());
-            }
+    if !force {
+        print!("Are you sure you want to remove {}? [y/N] ", self.filename);
+        io::stdout().flush()?;
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        if !input.trim().eq_ignore_ascii_case("y") {
+            return Ok(());
         }
-
-        // Remove all symlinks
-        let shares_dir = PathBuf::from(&config.base_dir);
-        for entry in fs::read_dir(&shares_dir)? {
-            let entry = entry?;
-            if let Ok(target) = fs::read_link(entry.path()) {
-                if target.ends_with(&self.uuid) {
-                    fs::remove_file(entry.path())?;
-                }
-            }
-        }
-
-        // Remove the file directory
-        let file_dir = PathBuf::from(&config.base_dir).join(&self.uuid);
-        remove_dir_all(file_dir)?;
-
-        // Update database
-        conn.execute(
-            "UPDATE shares SET active = 0, date_removed = ? WHERE uuid = ?",
-            params![Utc::now(), self.uuid],
-        )?;
-
-        conn.execute("DELETE FROM files WHERE uuid = ?", [&self.uuid])?;
-
-        Ok(())
     }
+
+    // Remove all symlinks
+    let shares_dir = PathBuf::from(&config.base_dir);
+    for entry in fs::read_dir(&shares_dir)? {
+        let entry = entry?;
+        if let Ok(target) = fs::read_link(entry.path()) {
+            if target.ends_with(&self.uuid) {
+                remove_file_with_access(&entry.path())?;
+            }
+        }
+    }
+
+    // Remove the file directory
+    let file_dir = PathBuf::from(&config.base_dir).join(&self.uuid);
+    remove_file_with_access(&file_dir)?;
+
+    // Update database
+    conn.execute(
+        "UPDATE shares SET active = 0, date_removed = ? WHERE uuid = ?",
+        params![Utc::now(), self.uuid],
+    )?;
+
+    conn.execute("DELETE FROM files WHERE uuid = ?", [&self.uuid])?;
+
+    Ok(())
+}
+
 }
 
 impl ShareInfo {

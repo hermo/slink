@@ -1,23 +1,71 @@
 mod commands;
 use chrono::{DateTime, Utc};
 use dirs::config_dir;
-use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as b64, Engine as _};
 use serde::{Deserialize, Serialize};
-use sha2::Sha256;
 use std::os::unix::fs::PermissionsExt;
 use std::{
     fs::{self, create_dir_all, remove_dir_all, set_permissions, Permissions},
     os::unix::fs::symlink as unix_symlink,
     path::{Path, PathBuf},
 };
+use nix::unistd::chown;
+use nix::unistd::{Gid, Uid};
+
 use structopt::StructOpt;
 use uuid::Uuid;
 
 use anyhow::{anyhow, Result};
 use std::io::{self, Write};
 
-type HmacSha256 = Hmac<Sha256>;
+/*
+slink is a self-hosted file sharing utility written in Rust that enables secure file sharing through unique URLs. The program manages files on a web server and creates secure, recipient-specific sharing links.
+
+Core functionality:
+- Files are stored with UUIDs in a base directory (e.g., /var/www/UUID/filename)
+- Sharing links are created using HMAC-SHA256 of UUID + recipient identifier
+- File and share information is tracked in SQLite
+- Configuration stored in ~/.config/slink/slink.conf (TOML format)
+- Runs on the server side, managing files directly
+
+Command interface:
+- add: Copy file to managed directory with UUID
+- share: Create recipient-specific sharing link
+- unshare: Remove sharing link but retain history
+- show: Display file info and share status
+- ls: List all managed files
+- rm: Remove file and its shares
+
+File structure:
+- Original file: BASE_DIR/UUID/filename
+- Share links: BASE_DIR/HMAC_HASH -> UUID (relative symlink)
+
+URL format:
+- Private: https://domain/UUID/filename
+- Shared: https://domain/HMAC_HASH/filename
+
+Security considerations:
+- Runs as dedicated user with appropriate permissions
+- Web server must follow symlinks
+- HMAC secret stored in config
+- Share history maintained in SQLite
+
+Database schema:
+- files: uuid, filename, date_added
+- shares: uuid, recipient, share_hash, date_shared, date_removed, active
+
+Configuration (slink.conf):
+- base_url: Web server URL
+- base_dir: File storage location
+- db_path: SQLite database path
+- hmac_secret: Secret for hash generation
+- web_user: Owner of files
+- web_group: Group for web access
+
+The program is designed to be simple, secure, and maintainable, following Unix philosophy of doing one thing well. It integrates with existing web servers and provides a straightforward CLI for file sharing management.
+*/
+
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
@@ -156,29 +204,50 @@ fn init_database(db_path: &str) -> Result<()> {
 }
 
 fn calculate_share_hash(uuid: &str, recipient: &str, secret: &str) -> Result<String> {
-    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())?;
-    mac.update(format!("{}{}", uuid, recipient).as_bytes());
-    Ok(base64::encode(mac.finalize().into_bytes())
-        .replace('/', "_")
-        .replace('+', "-"))
+    // Create a 32-byte key from the secret using BLAKE3 itself
+    let mut key = [0u8; 32];
+    let key_hash = blake3::hash(secret.as_bytes());
+    key.copy_from_slice(key_hash.as_bytes());
+
+    let keyed_hash = blake3::keyed_hash(
+        &key,
+        format!("{}{}", uuid, recipient).as_bytes(),
+    );
+
+    Ok(b64.encode(keyed_hash.as_bytes()))
 }
 
-fn set_permissions_recursive(path: &Path, dir_mode: u32, file_mode: u32, 
-                           web_user: &str, web_group: &str) -> Result<()> {
-    // Note: This is a simplified version. In real implementation, you'd want to use
-    // proper user/group management here with nix crate
+fn set_permissions_recursive(
+    path: &Path,
+    dir_mode: u32,
+    file_mode: u32,
+    web_user: &str,
+    web_group: &str,
+) -> Result<()> {
+    // Resolve the user and group IDs
+    let uid = users::get_user_by_name(web_user)
+        .ok_or_else(|| anyhow::anyhow!("User {} not found", web_user))?
+        .uid();
+    let gid = users::get_group_by_name(web_group)
+        .ok_or_else(|| anyhow::anyhow!("Group {} not found", web_group))?
+        .gid();
+
     if path.is_dir() {
+        // Set directory permissions and ownership
         set_permissions(path, Permissions::from_mode(dir_mode))?;
+        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             set_permissions_recursive(&entry.path(), dir_mode, file_mode, web_user, web_group)?;
         }
     } else {
+        // Set file permissions and ownership
         set_permissions(path, Permissions::from_mode(file_mode))?;
+        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
     }
     Ok(())
 }
-
 
 impl FileShare {
     fn add(conn: &Connection, config: &Config, file_path: &str) -> Result<String> {

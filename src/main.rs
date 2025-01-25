@@ -59,7 +59,7 @@ Configuration (slink.conf):
 - base_url: Web server URL
 - base_dir: File storage location
 - db_path: SQLite database path
-- hmac_secret: Secret for hash generation
+- hash_secret: Secret for hash generation
 - web_user: Owner of files
 - web_group: Group for web access
 
@@ -72,7 +72,7 @@ struct Config {
     base_url: String,
     base_dir: String,
     db_path: String,
-    hmac_secret: String,
+    hash_secret: String,
     web_user: String,
     web_group: String,
 }
@@ -139,7 +139,7 @@ impl Config {
                     .join("shares.db")
                     .to_string_lossy()
                     .to_string(),
-                hmac_secret: Uuid::new_v4().to_string(),
+                hash_secret: Uuid::new_v4().to_string(),
                 web_user: "www-data".to_string(),
                 web_group: "www-data".to_string(),
             };
@@ -350,7 +350,7 @@ impl FileShare {
 
 impl ShareInfo {
     fn share(conn: &Connection, config: &Config, uuid: &str, recipient: &str) -> Result<String> {
-        let share_hash = calculate_share_hash(uuid, recipient, &config.hmac_secret)?;
+        let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret)?;
 
         // Create symlink with relative path
         let source = PathBuf::from(&config.base_dir).join(&share_hash);
@@ -372,7 +372,7 @@ impl ShareInfo {
 
 
     fn unshare(conn: &Connection, config: &Config, uuid: &str, recipient: &str) -> Result<()> {
-        let share_hash = calculate_share_hash(uuid, recipient, &config.hmac_secret)?;
+        let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret)?;
 
         // Remove symlink
         let symlink = PathBuf::from(&config.base_dir).join(&share_hash);

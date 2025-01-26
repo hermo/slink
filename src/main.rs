@@ -1,3 +1,4 @@
+// src/main.rs
 mod commands;
 use chrono::{DateTime, Utc};
 use dirs::config_dir;

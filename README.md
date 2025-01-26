@@ -17,6 +17,12 @@
 cargo install slink
 ```
 
+If you want to allow the app to alter file owners you may grant it the proper capabilities.
+Note that this comes with security implications, user beware.
+```
+sudo setcap cap_chown+ep slink
+```
+
 ## Configuration
 
 On first run, `slink` creates a configuration file at `~/.config/slink/slink.conf`:

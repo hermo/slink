@@ -1,15 +1,16 @@
 # slink - Simple Secure File Sharing
 
-`slink` is a self-hosted solution for sharing files via HTTPS with unique sharing links. It manages files on your web server and creates secure, recipient-specific sharing URLs.
+`slink` is a self-hosted solution for sharing files via HTTPS with unique sharing links. It manages
+files on your web server and creates secure, recipient-specific sharing URLs.
 
 ## Features
 
-- Self-hosted file sharing
+- Self-hosted file sharing with your preferred web server
 - Unique sharing links per recipient
 - Command line interface
 - Share history tracking
-- Automatic configuration
-- Uses HMAC-SHA256 for link generation
+- Uses BLAKE3 for secure link generation
+- Configurable hash entropy
 
 ## Installation
 
@@ -34,23 +35,35 @@ db_path = "/home/user/.local/share/slink/shares.db"
 hmac_secret = "random-generated-secret"
 web_user = "www-data"
 web_group = "www-data"
+hash_bytes = 7
 ```
 
 Ensure your web server is configured to serve files from `base_dir` and that symlinks are followed.
 
+The hash_bytes setting controls the length of the generated share hashes. The default of 7 bytes
+(56 bits of entropy) provides a balance between URL length and security, requiring on average over
+11 years of continuous guessing at 100M attempts per second to find a valid hash. Increase this
+value if you need additional security.
+
+
 ## Usage
 
 ### Add a file
+The following command crates a UUID and copies document.pdf to the proper location.
 ```bash
 slink add document.pdf
 # Added file with UUID: 09d1cc19-1efe-42f2-9292-a33e60d44de5
 ```
 
+
 ### Share a file
+Now that document.pdf is known by slink, we can refer to it with the filename or UUID and share it
+with some recipient. The recipient name can be anything, an email-like address is just an example.
+
 ```bash
 slink share alice@example.com document.pdf
 # Shared document.pdf with alice@example.com:
-# http://localhost:8080/PTuetwayY0q_EID5TAslxOm3a1KPaFqcYnt3_AU73cY=/document.pdf
+# http://localhost:8080/KJh8h7G6dT/document.pdf
 ```
 
 ### Show file information
@@ -61,22 +74,22 @@ slink show document.pdf
 # Added: 2025-01-23 20:15:30
 # 
 # Shares:
-# +-----------------+--------+---------------------+---------------------+--------------------------------------------------------+
-# | Recipient       | Status | Shared              | Removed            | URL                                                     |
-# +-----------------+--------+---------------------+---------------------+--------------------------------------------------------+
-# | alice@example.com| Active | 2025-01-23 20:16:00| -                  | http://localhost:8080/PTuetwayY0q.../document.pdf       |
-# | bob@example.com  | Removed| 2025-01-23 20:16:30| 2025-01-23 20:17:00| http://localhost:8080/KJh8h7G6f5.../document.pdf        |
-# +-----------------+--------+---------------------+---------------------+--------------------------------------------------------+
+# +-----------------+----------+---------------------+---------------------+-----------------------------------------------+
+# | Recipient       | Status   | Shared              | Removed             | URL                                           |
+# +-----------------+----------+---------------------+---------------------+-----------------------------------------------+
+# | alice@example.com| Active  | 2025-01-23 20:16:00 | -                   | http://localhost:8080/eUgCTjtB_Q/document.pdf |
+# | bob@example.com  | Removed | 2025-01-23 20:16:30 | 2025-01-23 20:17:00 | http://localhost:8080/KJh8h7G6dT/document.pdf |
+# +-----------------+----------+---------------------+---------------------+-----------------------------------------------+
 ```
 
 ### List all files
 ```bash
 slink ls
-# +--------------+--------------------------------------+---------------------+---------------+
-# | Filename     | UUID                                 | Added               | Active Shares |
-# +--------------+--------------------------------------+---------------------+---------------+
-# | document.pdf | 09d1cc19-1efe-42f2-9292-a33e60d44de5| 2025-01-23 20:15:30| 1               |
-# +--------------+--------------------------------------+---------------------+---------------+
+# +--------------+--------------------------------------+--------------------+---------------+
+# | Filename     | UUID                                 | Added              | Active Shares |
+# +--------------+--------------------------------------+--------------------+---------------+
+# | document.pdf | 09d1cc19-1efe-42f2-9292-a33e60d44de5| 2025-01-23 20:15:30 | 1             |
+# +--------------+--------------------------------------+--------------------+---------------+
 ```
 
 ### Remove share

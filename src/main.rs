@@ -80,6 +80,7 @@ struct Config {
     hash_secret: String,
     web_user: String,
     web_group: String,
+    hash_bytes: usize,
 }
 
 #[derive(Debug, StructOpt)]
@@ -147,6 +148,13 @@ impl Config {
                 hash_secret: Uuid::new_v4().to_string(),
                 web_user: "www-data".to_string(),
                 web_group: "www-data".to_string(),
+                // A mere 256^7 (56 bits) of entropy by default?!
+                // This translates to  an average of just  over 11 years
+                // of trying  100M times  per second before  an attacker
+                // guesses the hash  of your precious file.  For me it's
+                // good enough  but it  *is* configurable if  this gives
+                // you the heebie jeebies.
+                hash_bytes: 7,
             };
 
             // Check if base directory exists
@@ -215,18 +223,14 @@ fn init_database(db_path: &str) -> Result<()> {
     Ok(())
 }
 
-fn calculate_share_hash(uuid: &str, recipient: &str, secret: &str) -> Result<String> {
-    // Create a 32-byte key from the secret using BLAKE3 itself
-    let mut key = [0u8; 32];
-    let key_hash = blake3::hash(secret.as_bytes());
-    key.copy_from_slice(key_hash.as_bytes());
-
+fn calculate_share_hash(uuid: &str, recipient: &str, secret: &str, hash_bytes: usize) -> Result<String> {
+    let key = blake3::derive_key("slink", secret.as_bytes());
     let keyed_hash = blake3::keyed_hash(
         &key,
         format!("{}{}", uuid, recipient).as_bytes(),
     );
 
-    Ok(b64.encode(keyed_hash.as_bytes()))
+    Ok(b64.encode(&keyed_hash.as_bytes()[..hash_bytes]))
 }
 
 fn set_permissions_recursive(
@@ -394,7 +398,7 @@ impl FileShare {
 
 impl ShareInfo {
     fn share(conn: &Connection, config: &Config, uuid: &str, recipient: &str) -> Result<String> {
-        let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret)?;
+        let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret, config.hash_bytes)?;
 
         // Create symlink with relative path
         let source = PathBuf::from(&config.base_dir).join(&share_hash);
@@ -416,7 +420,7 @@ impl ShareInfo {
 
 
     fn unshare(conn: &Connection, config: &Config, uuid: &str, recipient: &str) -> Result<()> {
-        let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret)?;
+        let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret, config.hash_bytes)?;
 
         // Remove symlink
         let symlink = PathBuf::from(&config.base_dir).join(&share_hash);

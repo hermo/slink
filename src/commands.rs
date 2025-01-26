@@ -5,8 +5,126 @@ use prettytable::{Table, row};
 use rusqlite::Connection;
 use std::path::Path;
 use dirs::config_dir;
-
+use std::fs;
+use crate::{init_database, create_dir_all};
 use crate::{Config, FileShare, ShareInfo};
+use crate::Uuid;
+use crate::{Permissions, PermissionsExt, set_permissions};
+use std::io::{self, Write};
+
+pub fn initialize_config() -> Result<()> {
+    let config_dir = config_dir()
+        .ok_or_else(|| anyhow!("Could not determine config directory"))?
+        .join("slink");
+    let config_path = config_dir.join("slink.conf");
+
+    if config_path.exists() {
+        return Err(anyhow!("Configuration file already exists at {}", config_path.display()));
+    }
+
+    println!("Initializing configuration...");
+
+    // Prompt for each configuration value
+    let base_url = prompt_with_default("Base URL", "http://localhost:8080")?;
+    let base_dir = prompt_with_validation("Base directory", "/var/www", |input| {
+        let path = Path::new(input);
+        if path.exists() && path.is_dir() {
+            Ok(())
+        } else {
+            Err("Base directory must exist and be a valid directory")
+        }
+    })?;
+    let db_path = prompt_with_default("Database path", &dirs::data_dir()
+        .ok_or_else(|| anyhow!("Could not determine data directory"))?
+        .join("slink")
+        .join("shares.db")
+        .to_string_lossy())?;
+    let hash_secret = prompt_with_default("Hash secret (leave empty to generate)", "*generate*")?;
+    let hash_secret = if hash_secret == "*generate*" || hash_secret.is_empty() {
+        // Generate a random password
+        Uuid::new_v4().to_string()
+    } else {
+        hash_secret
+    };
+    let web_user = prompt_with_validation("Web user", "www-data", |input| {
+        if users::get_user_by_name(input).is_some() {
+            Ok(())
+        } else {
+            Err("Web user must exist")
+        }
+    })?;
+    let web_group = prompt_with_validation("Web group", "www-data", |input| {
+        if users::get_group_by_name(input).is_some() {
+            Ok(())
+        } else {
+            Err("Web group must exist")
+        }
+    })?;
+    let hash_bytes = prompt_with_validation("Hash bytes (2-32)", "7", |input| {
+        input.parse::<usize>()
+            .map_err(|_| "Hash bytes must be a number")
+            .and_then(|value| {
+                if (2..=32).contains(&value) {
+                    Ok(())
+                } else {
+                    Err("Hash bytes must be between 2 and 32")
+                }
+            })
+    })?.parse::<usize>()?;
+
+    // Create configuration
+    let config = Config {
+        base_url,
+        base_dir,
+        db_path,
+        hash_secret,
+        web_user,
+        web_group,
+        hash_bytes,
+    };
+
+    // Create config directory and write the configuration file
+    create_dir_all(&config_dir)
+        .map_err(|e| anyhow!("Failed to create config directory: {}", e))?;
+    fs::write(&config_path, toml::to_string(&config)?)
+        .map_err(|e| anyhow!("Failed to write config file {}: {}", config_path.display(), e))?;
+
+    // Set permissions to 0600
+    set_permissions(&config_path, Permissions::from_mode(0o600))
+        .map_err(|e| anyhow!("Failed to set permissions on config file {}: {}", config_path.display(), e))?;
+
+    // Initialize the database
+    create_dir_all(Path::new(&config.db_path).parent().unwrap())
+        .map_err(|e| anyhow!("Failed to create database directory: {}", e))?;
+    init_database(&config.db_path)
+        .map_err(|e| anyhow!("Failed to initialize database {}: {}", config.db_path, e))?;
+
+    println!("Configuration saved to {}", config_path.display());
+    Ok(())
+}
+
+fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
+    print!("{} [{}]: ", prompt, default);
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+    Ok(if input.is_empty() { default.to_string() } else { input.to_string() })
+}
+
+fn prompt_with_validation<F>(prompt: &str, default: &str, validate: F) -> Result<String>
+where
+    F: Fn(&str) -> Result<(), &str>,
+{
+    loop {
+        let input = prompt_with_default(prompt, default)?;
+        if let Err(err) = validate(&input) {
+            println!("Invalid input: {}", err);
+        } else {
+            return Ok(input);
+        }
+    }
+}
 
 pub fn add_file(config: &Config, file_path: &str) -> Result<String> {
     let conn = Connection::open(&config.db_path)?;

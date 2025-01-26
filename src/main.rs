@@ -87,6 +87,8 @@ struct Config {
 #[derive(Debug, StructOpt)]
 #[structopt(name = "slink", about = "Secure file sharing utility")]
 enum Opt {
+    #[structopt(name = "init")]
+    Init,
     #[structopt(name = "add")]
     Add {
         file: String,
@@ -151,67 +153,29 @@ impl Config {
             .join("slink.conf");
 
         if !config_path.exists() {
-            let config = Config {
-                base_url: "http://localhost:8080".to_string(),
-                base_dir: "/var/www".to_string(),
-                db_path: dirs::data_dir()
-                    .ok_or_else(|| anyhow!("Could not determine data directory"))?
-                    .join("slink")
-                    .join("shares.db")
-                    .to_string_lossy()
-                    .to_string(),
-                hash_secret: Uuid::new_v4().to_string(),
-                web_user: "www-data".to_string(),
-                web_group: "www-data".to_string(),
-                // A mere 256^7 (56 bits) of entropy by default?!
-                // This translates to  an average of just  over 11 years
-                // of trying  100M times  per second before  an attacker
-                // guesses the hash  of your precious file.  For me it's
-                // good enough  but it  *is* configurable if  this gives
-                // you the heebie jeebies.
-                hash_bytes: 7,
-            };
+            return Err(anyhow!(
+                "Configuration file not found. Please run `slink init` to create one."
+            ));
+        }
 
-            // Check if base directory exists
-            if !Path::new(&config.base_dir).exists() {
-                return Err(anyhow!("Base directory {} does not exist. Please create it with appropriate permissions", config.base_dir));
-            }
+        // Check config file permissions
+        if let Err(e) = Config::check_permissions(&config_path) {
+            eprintln!("WARNING: {}", e);
+        }
 
-            // Try to create config directory
-            create_dir_all(config_path.parent().unwrap())
-                .map_err(|e| anyhow!("Failed to create config directory: {}", e))?;
+        let content = fs::read_to_string(&config_path)
+            .map_err(|e| anyhow!("Failed to read config file {}: {}", config_path.display(), e))?;
+        let config: Config = toml::from_str(&content)?;
 
-            // Try to write config file
-            fs::write(&config_path, toml::to_string(&config)?)
-                .map_err(|e| anyhow!("Failed to write config file {}: {}", config_path.display(), e))?;
-
-            // Try to create database directory
-            create_dir_all(Path::new(&config.db_path).parent().unwrap())
-                .map_err(|e| anyhow!("Failed to create database directory: {}", e))?;
-
+        if !Path::new(&config.db_path).join("shares.db").exists() {
             // Try to initialize database
             init_database(&config.db_path)
                 .map_err(|e| anyhow!("Failed to initialize database {}: {}", config.db_path, e))?;
-
-            Ok(config)
-        } else {
-            // Check config file permissions
-            if let Err(e) = Config::check_permissions(&config_path) {
-                eprintln!("WARNING: {}", e);
-            }
-
-            let content = fs::read_to_string(&config_path)
-                .map_err(|e| anyhow!("Failed to read config file {}: {}", config_path.display(), e))?;
-            let config:Config = toml::from_str(&content)?;
-
-            if !Path::new(&config.db_path).join("shares.db").exists() {
-                // Try to initialize database
-                init_database(&config.db_path)
-                    .map_err(|e| anyhow!("Failed to initialize database {}: {}", config.db_path, e))?;
-            }
-            Ok(config)
         }
+        Ok(config)
     }
+
+
 }
 
 fn init_database(db_path: &str) -> Result<()> {
@@ -480,8 +444,17 @@ impl ShareInfo {
 
 fn main() -> Result<()> {
     let opt = Opt::from_args();
+
+    // Handle `slink init` command separately
+    if let Opt::Init = opt {
+        commands::initialize_config()?;
+        return Ok(());
+    }
+
+    // For all other commands, load the configuration
     let config = Config::load_or_create()?;
 
+    // Match and execute other commands
     match opt {
         Opt::Add { file } => {
             commands::add_file(&config, &file)?;
@@ -503,6 +476,9 @@ fn main() -> Result<()> {
         }
         Opt::Info => {
             commands::show_info(&config)?;
+        }
+        Opt::Init => {
+            // This case is already handled above
         }
     }
 

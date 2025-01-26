@@ -163,11 +163,6 @@ pub fn show_info(config: &Config) -> Result<()> {
 
     println!("Config file: {}", config_path.display());
 
-    // Check config file permissions
-    if let Err(e) = Config::check_permissions(&config_path) {
-        println!("WARNING: {}", e);
-    }
-
     if config_path.exists() {
         println!("\nCurrent configuration:");
         println!("Base URL: {}", config.base_url);

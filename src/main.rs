@@ -195,6 +195,11 @@ impl Config {
 
             Ok(config)
         } else {
+            // Check config file permissions
+            if let Err(e) = Config::check_permissions(&config_path) {
+                eprintln!("WARNING: {}", e);
+            }
+
             let content = fs::read_to_string(&config_path)
                 .map_err(|e| anyhow!("Failed to read config file {}: {}", config_path.display(), e))?;
             let config:Config = toml::from_str(&content)?;
@@ -496,9 +501,8 @@ fn main() -> Result<()> {
         Opt::Remove { file, force } => {
             commands::remove_file(&config, &file, force)?;
         }
-
         Opt::Info => {
-        commands::show_info(&config)?;
+            commands::show_info(&config)?;
         }
     }
 

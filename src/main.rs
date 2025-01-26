@@ -199,7 +199,7 @@ fn init_database(db_path: &str) -> Result<()> {
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS files (
-            uuid TEXT PRIMARY KEY,
+            uuid CHAR(36) NOT NULL PRIMARY KEY,
             filename TEXT NOT NULL,
             date_added DATETIME NOT NULL
         )",
@@ -207,8 +207,8 @@ fn init_database(db_path: &str) -> Result<()> {
     )?;
 
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS shares (
-            uuid TEXT NOT NULL,
+       "CREATE TABLE IF NOT EXISTS shares (
+            uuid CHAR(36) NOT NULL,
             recipient TEXT NOT NULL,
             share_hash TEXT NOT NULL,
             date_shared DATETIME NOT NULL,
@@ -311,6 +311,7 @@ impl FileShare {
         create_dir_all(&target_dir)?;
         fs::copy(&path, &target_file)?;
 
+        // TODO: Make permissions configurable
         set_permissions_recursive(
             &target_dir,
             0o750,

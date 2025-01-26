@@ -113,6 +113,8 @@ enum Opt {
         #[structopt(short = "f", long = "force")]
         force: bool,
     },
+    #[structopt(name = "info")]
+    Info,
 }
 
 struct FileShare {
@@ -130,6 +132,18 @@ struct ShareInfo {
 }
 
 impl Config {
+     fn check_permissions(config_path: &Path) -> Result<()> {
+        let metadata = fs::metadata(config_path)?;
+        let mode = metadata.permissions().mode();
+
+        // Check if file is readable by group or others
+        if mode & 0o077 != 0 {
+            return Err(anyhow!("Config file permissions too loose. Use chmod 600 {}",
+                config_path.display()));
+        }
+        Ok(())
+    }
+
     fn load_or_create() -> Result<Self> {
         let config_path = config_dir()
             .ok_or_else(|| anyhow!("Could not determine config directory"))?
@@ -481,6 +495,10 @@ fn main() -> Result<()> {
         }
         Opt::Remove { file, force } => {
             commands::remove_file(&config, &file, force)?;
+        }
+
+        Opt::Info => {
+        commands::show_info(&config)?;
         }
     }
 

@@ -3,6 +3,8 @@ use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use prettytable::{Table, row};
 use rusqlite::Connection;
+use std::path::Path;
+use dirs::config_dir;
 
 use crate::{Config, FileShare, ShareInfo};
 
@@ -148,5 +150,83 @@ fn resolve_file_spec(conn: &Connection, file_spec: &str) -> Result<String> {
     matches.get(index - 1)
         .map(|(uuid, _)| uuid.clone())
         .ok_or_else(|| anyhow!("Invalid file index"))
+}
+
+pub fn show_info(config: &Config) -> Result<()> {
+    println!("slink v{}", env!("CARGO_PKG_VERSION"));
+    println!("\nConfiguration:");
+
+    let config_path = config_dir()
+        .ok_or_else(|| anyhow!("Could not determine config directory"))?
+        .join("slink")
+        .join("slink.conf");
+
+    println!("Config file: {}", config_path.display());
+
+    // Check config file permissions
+    if let Err(e) = Config::check_permissions(&config_path) {
+        println!("WARNING: {}", e);
+    }
+
+    if config_path.exists() {
+        println!("\nCurrent configuration:");
+        println!("Base URL: {}", config.base_url);
+        println!("Base directory: {}", config.base_dir);
+        println!("Database path: {}", config.db_path);
+        println!("Hash secret: {}..[REDACTED]..{}", 
+            &config.hash_secret[..2],
+            &config.hash_secret[config.hash_secret.len()-2..]
+        );
+        println!("Web user: {}", config.web_user);
+        println!("Web group: {}", config.web_group);
+        println!("Hash bytes: {} ({} bits of entropy)", config.hash_bytes, config.hash_bytes*8);
+    } else {
+        println!("\nNo configuration file found. Default configuration will be created on first use.");
+    }
+
+    // Database statistics
+    let db_path = Path::new(&config.db_path);
+    if db_path.exists() {
+        println!("\nDatabase statistics:");
+        let conn = Connection::open(&config.db_path)?;
+
+        let file_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM files",
+            [],
+            |row| row.get(0)
+        )?;
+
+        let total_shares: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM shares",
+            [],
+            |row| row.get(0)
+        )?;
+
+        let active_shares: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM shares WHERE active = 1",
+            [],
+            |row| row.get(0)
+        )?;
+
+        // Handle NULL case explicitly for oldest file
+        let oldest_file: String = if file_count > 0 {
+            conn.query_row(
+                "SELECT date_added FROM files ORDER BY date_added ASC LIMIT 1",
+                [],
+                |row| row.get::<_, DateTime<Utc>>(0)
+            ).map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())?
+        } else {
+            "No files".to_string()
+        };
+
+        println!("Total files: {}", file_count);
+        println!("Total shares: {}", total_shares);
+        println!("Active shares: {}", active_shares);
+        println!("Oldest file: {}", oldest_file);
+    } else {
+        println!("\nDatabase not initialized yet.");
+    }
+
+    Ok(())
 }
 

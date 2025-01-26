@@ -20,7 +20,9 @@ use anyhow::{anyhow, Result};
 use std::io::{self, Write};
 
 /*
-slink is a self-hosted file sharing utility written in Rust that enables secure file sharing through unique URLs. The program manages files on a web server and creates secure, recipient-specific sharing links.
+slink is a self-hosted file sharing  utility written in Rust that enables secure
+file sharing through unique URLs. The program  manages files on a web server and
+creates secure, recipient-specific sharing links.
 
 Core functionality:
 - Files are stored with UUIDs in a base directory (e.g., /var/www/UUID/filename)
@@ -62,8 +64,11 @@ Configuration (slink.conf):
 - hash_secret: Secret for hash generation
 - web_user: Owner of files
 - web_group: Group for web access
+- hash_bytes: Length of resulting hash before base64 encoding
 
-The program is designed to be simple, secure, and maintainable, following Unix philosophy of doing one thing well. It integrates with existing web servers and provides a straightforward CLI for file sharing management.
+The program is  designed to be simple, secure, and  maintainable, following Unix
+philosophy of doing one thing well.  It integrates with existing web servers and
+provides a straightforward CLI for file sharing management.
 */
 
 

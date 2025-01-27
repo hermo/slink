@@ -102,6 +102,17 @@ slink share alice@example.com document.pdf
 # http://localhost:8080/KJh8h7G6dT/document.pdf
 ```
 
+### Add and Share in One Step
+You can add a file and immediately share it using the `-s` flag:
+
+```bash
+slink add document.pdf -s alice@example.com
+# BLAKE3: 7d05258389f606f31856a295b5a7f72dd82a8f3e8d6a7b5f0c4f8e6d5c4b3a2
+# Added file with UUID: 09d1cc19-1efe-42f2-9292-a33e60d44de5
+# Shared document.pdf with alice@example.com:
+# http://localhost:8080/KJh8h7G6dT/document.pdf
+```
+
 ### Show File Information
 ```bash
 slink show document.pdf
@@ -164,6 +175,37 @@ You can also reference files directly by UUID:
 ```bash
 slink show 09d1cc19-1efe-42f2-9292-a33e60d44de5
 ```
+
+### Remote Usage
+
+Files can be uploaded directly to a remote server using SSH. The `-` argument tells `slink` to read from stdin, and the `-n` flag specifies the filename to use.
+
+Upload a file:
+```bash
+ssh example.com slink add - -n "document.pdf" < document.pdf
+# BLAKE3: 7d05258389f606f31856a295b5a7f72dd82a8f3e8d6a7b5f0c4f8e6d5c4b3a2
+# Added file with UUID: 09d1cc19-1efe-42f2-9292-a33e60d44de5
+```
+
+Using pipe:
+```bash
+cat document.pdf | ssh example.com slink add - -n "document.pdf"
+```
+
+Generate and upload archive:
+```bash
+tar czf - files/ | ssh example.com slink add - -n "files.tar.gz"
+```
+
+Upload with progress using `pv`:
+```bash
+pv document.pdf | ssh example.com slink add - -n "document.pdf"
+# 156MB 0:00:15 [10.4MB/s] [======================>] 100%
+# BLAKE3: 7d05258389f606f31856a295b5a7f72dd82a8f3e8d6a7b5f0c4f8e6d5c4b3a2
+# Added file with UUID: 09d1cc19-1efe-42f2-9292-a33e60d44de5
+```
+
+The BLAKE3 hash is printed after successful upload and can be used to verify file integrity.
 
 ## Web Server Configuration
 

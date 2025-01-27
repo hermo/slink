@@ -92,6 +92,10 @@ enum Opt {
     #[structopt(name = "add")]
     Add {
         file: String,
+        #[structopt(short = "n", long = "name")]
+        name: Option<String>,
+        #[structopt(short = "s", long = "share")]
+        share: Option<String>,
     },
     #[structopt(name = "share")]
     Share {
@@ -281,37 +285,6 @@ fn remove_file_with_access(path: &Path) -> Result<()> {
 
 
 impl FileShare {
-    fn add(conn: &Connection, config: &Config, file_path: &str) -> Result<String> {
-        let path = PathBuf::from(file_path);
-        let filename = path.file_name()
-            .ok_or_else(|| anyhow!("Invalid filename"))?
-            .to_string_lossy()
-            .to_string();
-
-        let uuid = Uuid::new_v4().to_string();
-        let target_dir = PathBuf::from(&config.base_dir).join(&uuid);
-        let target_file = target_dir.join(&filename);
-
-        create_dir_all(&target_dir)?;
-        fs::copy(&path, &target_file)?;
-
-        // TODO: Make permissions configurable
-        set_permissions_recursive(
-            &target_dir,
-            0o750,
-            0o640,
-            &config.web_user,
-            &config.web_group,
-        )?;
-
-        conn.execute(
-            "INSERT INTO files (uuid, filename, date_added) VALUES (?1, ?2, ?3)",
-            params![uuid, filename, Utc::now()],
-        )?;
-
-        Ok(uuid)
-    }
-
     fn find_by_name(conn: &Connection, filename: &str) -> Result<Vec<(String, DateTime<Utc>)>> {
         let mut stmt = conn.prepare(
             "SELECT uuid, date_added FROM files WHERE filename = ? ORDER BY date_added"
@@ -456,9 +429,12 @@ fn main() -> Result<()> {
 
     // Match and execute other commands
     match opt {
-        Opt::Add { file } => {
-            commands::add_file(&config, &file)?;
-        }
+        Opt::Add { file, name, share } => {
+            let uuid = commands::add_file(&config, &file, name)?;
+            if let Some(recipient) = share {
+                commands::share_file(&config, &recipient, &uuid)?;
+            }
+        },
         Opt::Share { recipient, file } => {
             commands::share_file(&config, &recipient, &file)?;
         }

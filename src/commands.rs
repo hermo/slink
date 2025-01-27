@@ -2,15 +2,17 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use prettytable::{Table, row};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 use std::path::Path;
 use dirs::config_dir;
 use std::fs;
+use std::path::PathBuf;
 use crate::{init_database, create_dir_all};
 use crate::{Config, FileShare, ShareInfo};
 use crate::Uuid;
-use crate::{Permissions, PermissionsExt, set_permissions};
-use std::io::{self, Write};
+use crate::{Permissions, PermissionsExt, set_permissions, set_permissions_recursive};
+use std::io::{self, Write, Read, BufReader, BufWriter};
+use tempfile::NamedTempFile;
 
 pub fn initialize_config() -> Result<()> {
     let config_dir = config_dir()
@@ -126,11 +128,149 @@ where
     }
 }
 
-pub fn add_file(config: &Config, file_path: &str) -> Result<String> {
+pub fn add_file(config: &Config, file_path: &str, name: Option<String>) -> Result<String> {
     let conn = Connection::open(&config.db_path)?;
-    let uuid = FileShare::add(&conn, config, file_path)?;
+
+    // Enable WAL mode for better concurrency
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+
+    // Sanitize and validate the provided name or get from file_path
+    let filename = if let Some(name) = name {
+        sanitize_filename(&name)?
+    } else {
+        let path = PathBuf::from(file_path);
+        path.file_name()
+            .ok_or_else(|| anyhow!("Invalid filename"))?
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let (final_path, checksum) = if file_path == "-" {
+        // Handle stdin input
+        handle_stdin_upload(&config.base_dir, &filename)?
+    } else {
+        // Handle regular file
+        let path = PathBuf::from(file_path);
+        (path.clone(), calculate_file_hash(&path)?)
+    };
+
+    let uuid = Uuid::new_v4().to_string();
+    let target_dir = PathBuf::from(&config.base_dir).join(&uuid);
+    let target_file = target_dir.join(&filename);
+
+    create_dir_all(&target_dir)?;
+    fs::copy(&final_path, &target_file)?;
+
+    // If this was a temp file, clean it up
+    if final_path.to_string_lossy().contains("slink_temp_") {
+        fs::remove_file(&final_path)?;
+    }
+
+    set_permissions_recursive(
+        &target_dir,
+        0o750,
+        0o640,
+        &config.web_user,
+        &config.web_group,
+    )?;
+
+    conn.execute(
+        "INSERT INTO files (uuid, filename, date_added) VALUES (?1, ?2, ?3)",
+        params![uuid, filename, Utc::now()],
+    )?;
+
+    println!("BLAKE3: {}", checksum);
     println!("Added file with UUID: {}", uuid);
+
     Ok(uuid)
+}
+
+fn sanitize_filename(name: &str) -> Result<String> {
+    let name = name.trim();
+
+    // Basic security checks
+    if name.is_empty() {
+        return Err(anyhow!("Empty filename not allowed"));
+    }
+
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err(anyhow!("Invalid characters in filename"));
+    }
+
+    // Remove any leading dots to prevent hidden files
+    let name = name.trim_start_matches('.');
+    if name.is_empty() {
+        return Err(anyhow!("Invalid filename (hidden files not allowed)"));
+    }
+
+    // Additional checks for problematic characters
+    if name.chars().any(|c| {
+        c.is_control() || matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+    }) {
+        return Err(anyhow!("Invalid characters in filename"));
+    }
+
+    Ok(name.to_string())
+}
+
+fn handle_stdin_upload(base_dir: &str, filename: &str) -> Result<(PathBuf, String)> {
+    // Create temp file with prefix
+    let temp_dir = PathBuf::from(base_dir);
+    let temp_file = NamedTempFile::new_in(&temp_dir)?
+        .into_temp_path();
+    let temp_path = temp_file.to_path_buf();
+
+    // Rename with our prefix and the actual filename
+    let new_name = temp_dir.join(format!("slink_temp_{}_{}", Uuid::new_v4(), filename));
+    fs::rename(&temp_path, &new_name)?;
+
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(false)
+        .open(&new_name)?;
+    let mut writer = BufWriter::new(file);
+
+    // Setup BLAKE3 hasher
+    let mut hasher = blake3::Hasher::new();
+
+    // Read from stdin and write to file while updating hash
+    let mut stdin = BufReader::new(io::stdin());
+    let mut buffer = [0; 8192];
+
+    loop {
+        match stdin.read(&mut buffer) {
+            Ok(0) => break, // EOF
+            Ok(n) => {
+                writer.write_all(&buffer[..n])?;
+                hasher.update(&buffer[..n]);
+            }
+            Err(e) => {
+                // Clean up temp file on error
+                let _ = fs::remove_file(&new_name);
+                return Err(anyhow!("Error reading from stdin: {}", e));
+            }
+        }
+    }
+
+    writer.flush()?;
+
+    Ok((new_name, hasher.finalize().to_hex().to_string()))
+}
+
+fn calculate_file_hash(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0; 8192];
+
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buffer[..n]),
+            Err(e) => return Err(anyhow!("Error reading file for hash: {}", e)),
+        };
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn share_file(config: &Config, recipient: &str, file_spec: &str) -> Result<()> {

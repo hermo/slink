@@ -7,11 +7,12 @@ use std::path::Path;
 use dirs::config_dir;
 use std::fs;
 use std::path::PathBuf;
-use crate::{init_database, create_dir_all};
+use crate::{init_database, create_dir_all, remove_file_with_access}; // Added remove_file_with_access
 use crate::{Config, FileShare, ShareInfo};
 use crate::Uuid;
 use crate::{Permissions, PermissionsExt, set_permissions, set_permissions_recursive};
 use std::io::{self, Write, Read, BufReader, BufWriter};
+use std::collections::HashSet; // Added for cleanup logic
 use tempfile::NamedTempFile;
 
 pub fn initialize_config() -> Result<()> {
@@ -273,11 +274,25 @@ fn calculate_file_hash(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub fn share_file(config: &Config, recipient: &str, file_spec: &str) -> Result<()> {
+pub fn share_file(
+    config: &Config,
+    recipient: &str,
+    file_spec: &str,
+    expires_at: Option<DateTime<Utc>>, // Added
+    delete_file_on_expiry: bool,      // Added
+) -> Result<()> {
     let conn = Connection::open(&config.db_path)?;
     let uuid = resolve_file_spec(&conn, file_spec)?;
 
-    let share_hash = ShareInfo::share(&conn, config, &uuid, recipient)?;
+    // Pass new arguments to ShareInfo::share (needs update next)
+    let share_hash = ShareInfo::share(
+        &conn,
+        config,
+        &uuid,
+        recipient,
+        expires_at,
+        delete_file_on_expiry,
+    )?;
     let file = FileShare::find_by_uuid(&conn, &uuid)?.ok_or_else(|| anyhow!("File not found"))?;
 
     println!("Shared {} with {}:", file.filename, recipient);
@@ -307,12 +322,15 @@ pub fn show_file(config: &Config, file_spec: &str) -> Result<()> {
     println!("\nShares:");
 
     let mut table = Table::new();
-    table.add_row(row!["Recipient", "Status", "Shared", "Removed", "URL"]);
+    table.add_row(row!["Recipient", "Status", "Shared", "Removed", "Expires At", "Delete on Expiry", "URL"]); // Added columns
 
     for share in shares {
         let status = if share.active { "Active" } else { "Removed" };
-        let removed = share.date_removed.map_or("-".to_string(), 
+        let removed = share.date_removed.map_or("-".to_string(),
             |d| d.format("%Y-%m-%d %H:%M:%S").to_string());
+        let expires = share.expires_at.map_or("-".to_string(), // Added expires formatting
+            |d| d.format("%Y-%m-%d %H:%M:%S").to_string());
+        let delete_on_expiry = if share.delete_file_on_expiry { "Yes" } else { "No" }; // Added delete flag formatting
         let url = format!("{}/{}/{}", config.base_url, share.share_hash, file.filename);
 
         table.add_row(row![
@@ -320,6 +338,8 @@ pub fn show_file(config: &Config, file_spec: &str) -> Result<()> {
             status,
             share.date_shared.format("%Y-%m-%d %H:%M:%S"),
             removed,
+            expires, // Added expires
+            delete_on_expiry, // Added delete flag
             url
         ]);
     }
@@ -331,32 +351,44 @@ pub fn show_file(config: &Config, file_spec: &str) -> Result<()> {
 pub fn list_files(config: &Config) -> Result<()> {
     let conn = Connection::open(&config.db_path)?;
     let mut stmt = conn.prepare(
-        "SELECT f.uuid, f.filename, f.date_added, COUNT(s.uuid) as share_count 
-         FROM files f 
-         LEFT JOIN shares s ON f.uuid = s.uuid AND s.active = 1
-         GROUP BY f.uuid 
+        "SELECT
+            f.uuid,
+            f.filename,
+            f.date_added,
+            COUNT(CASE WHEN s.active = 1 THEN s.uuid END) as active_share_count,
+            COUNT(CASE WHEN s.active = 1 AND s.expires_at IS NOT NULL THEN s.uuid END) as expiring_share_count,
+            COUNT(CASE WHEN s.active = 1 AND s.expires_at IS NOT NULL AND s.delete_file_on_expiry = 1 THEN s.uuid END) as deleting_share_count
+         FROM files f
+         LEFT JOIN shares s ON f.uuid = s.uuid
+         GROUP BY f.uuid, f.filename, f.date_added -- Ensure correct grouping
          ORDER BY f.date_added DESC"
     )?;
 
     let mut table = Table::new();
-    table.add_row(row!["Filename", "UUID", "Added", "Active Shares"]);
+    // Added "Expiring" and "Deletes File" columns
+    table.add_row(row!["Filename", "UUID", "Added", "Active Shares", "Expiring", "Deletes File"]);
 
     let rows = stmt.query_map([], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, DateTime<Utc>>(2)?,
-            row.get::<_, i64>(3)?
+            row.get::<_, String>(0)?, // uuid
+            row.get::<_, String>(1)?, // filename
+            row.get::<_, DateTime<Utc>>(2)?, // date_added
+            row.get::<_, i64>(3)?, // active_share_count
+            row.get::<_, i64>(4)?, // expiring_share_count
+            row.get::<_, i64>(5)?  // deleting_share_count
         ))
     })?;
 
     for row in rows {
-        let (uuid, filename, date_added, share_count) = row?;
+        // Unpack the new counts
+        let (uuid, filename, date_added, active_share_count, expiring_share_count, deleting_share_count) = row?;
         table.add_row(row![
             filename,
             uuid,
             date_added.format("%Y-%m-%d %H:%M:%S"),
-            share_count
+            active_share_count,
+            expiring_share_count, // Add expiring count
+            deleting_share_count  // Add deleting count
         ]);
     }
 
@@ -483,3 +515,127 @@ pub fn show_info(config: &Config) -> Result<()> {
     Ok(())
 }
 
+
+// New function to handle cleanup of expired items
+pub fn cleanup_expired_items(config: &Config) -> Result<()> {
+    println!("Starting cleanup of expired shares...");
+    let conn = Connection::open(&config.db_path)?;
+    let mut uuids_to_check_for_deletion = HashSet::new();
+    let mut expired_shares_count = 0;
+    let mut files_deleted_count = 0;
+
+    // Step 1: Process Expired Shares
+    { // Scope for the prepared statement
+        let mut stmt = conn.prepare(
+            "SELECT uuid, recipient, share_hash, delete_file_on_expiry
+             FROM shares
+             WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?"
+        )?;
+        let now = Utc::now();
+        let expired_iter = stmt.query_map(params![now], |row| {
+            Ok((
+                row.get::<_, String>(0)?, // uuid
+                row.get::<_, String>(1)?, // recipient
+                row.get::<_, String>(2)?, // share_hash
+                row.get::<_, bool>(3)?,   // delete_file_on_expiry
+            ))
+        })?;
+
+        for expired_result in expired_iter {
+            match expired_result {
+                Ok((uuid, recipient, share_hash, delete_on_expiry)) => {
+                    expired_shares_count += 1;
+                    println!(" Expiring share for {} (recipient: {})", uuid, recipient);
+
+                    // Remove symlink
+                    let symlink_path = PathBuf::from(&config.base_dir).join(&share_hash);
+                    if symlink_path.exists() {
+                        if let Err(e) = fs::remove_file(&symlink_path) {
+                             eprintln!("  WARN: Failed to remove symlink {}: {}", symlink_path.display(), e);
+                             // Continue processing even if symlink removal fails
+                        }
+                    } else {
+                         eprintln!("  WARN: Symlink {} not found, skipping removal.", symlink_path.display());
+                    }
+
+                    // Update share record in DB
+                    if let Err(e) = conn.execute(
+                        "UPDATE shares SET active = 0, date_removed = ? WHERE uuid = ? AND recipient = ?",
+                        params![Utc::now(), uuid, recipient],
+                    ) {
+                         eprintln!("  ERROR: Failed to update share record for {}/{}: {}", uuid, recipient, e);
+                         // Continue processing other shares
+                         continue; // Skip adding to deletion check if DB update failed
+                    }
+
+                    // If marked, add UUID to the set for potential file deletion
+                    if delete_on_expiry {
+                        uuids_to_check_for_deletion.insert(uuid);
+                    }
+                }
+                Err(e) => {
+                    eprintln!(" ERROR: Failed to process an expired share row: {}", e);
+                    // Continue processing other shares
+                }
+            }
+        }
+    } // Statement goes out of scope here
+
+    if expired_shares_count > 0 {
+         println!(" Processed {} expired shares.", expired_shares_count);
+    } else {
+         println!(" No expired shares found.");
+    }
+
+
+    // Step 2: Attempt File Deletion for relevant UUIDs
+    if !uuids_to_check_for_deletion.is_empty() {
+        println!(" Checking {} files for potential deletion...", uuids_to_check_for_deletion.len());
+        for uuid in uuids_to_check_for_deletion {
+            // Check if any other active shares exist for this file
+            let active_shares_count: i64 = match conn.query_row(
+                "SELECT COUNT(*) FROM shares WHERE uuid = ? AND active = 1",
+                params![uuid],
+                |row| row.get(0),
+            ) {
+                Ok(count) => count,
+                Err(e) => {
+                    eprintln!("  ERROR: Failed to check active shares for file {}: {}", uuid, e);
+                    continue; // Skip deletion check for this file
+                }
+            };
+
+            if active_shares_count == 0 {
+                println!("  File {} has no remaining active shares. Attempting deletion...", uuid);
+                // No active shares left, proceed with file deletion
+                let file_dir_path = PathBuf::from(&config.base_dir).join(&uuid);
+
+                // Use remove_file_with_access to handle permissions and removal
+                if file_dir_path.exists() {
+                    if let Err(e) = remove_file_with_access(&file_dir_path) {
+                        eprintln!("   ERROR: Failed to remove file directory {}: {}", file_dir_path.display(), e);
+                        // Continue to attempt DB cleanup even if file removal fails
+                    } else {
+                         println!("   Successfully removed file directory {}", file_dir_path.display());
+                         files_deleted_count += 1;
+                    }
+                } else {
+                     eprintln!("   WARN: File directory {} not found, skipping removal.", file_dir_path.display());
+                }
+
+
+                // Remove file record from DB
+                if let Err(e) = conn.execute("DELETE FROM files WHERE uuid = ?", params![uuid]) {
+                    eprintln!("   ERROR: Failed to delete file record {} from database: {}", uuid, e);
+                } else {
+                     println!("   Successfully removed file record {} from database.", uuid);
+                }
+            } else {
+                 println!("  File {} still has {} active shares, skipping deletion.", uuid, active_shares_count);
+            }
+        }
+    }
+
+    println!(" Cleanup finished. Expired shares processed: {}. Files deleted: {}.", expired_shares_count, files_deleted_count);
+    Ok(())
+}

@@ -13,6 +13,7 @@ It manages files on your web server and creates secure, recipient-specific shari
 - Configurable hash entropy
 - Interactive configuration setup with validation
 - Secure configuration file creation with strict permissions (```0600```)
+- Expiring shares and optional automatic file deletion upon expiry
 
 ## Installation
 
@@ -20,12 +21,37 @@ It manages files on your web server and creates secure, recipient-specific shari
 cargo install slink
 ```
 
-If you want to allow the app to alter file owners, you may grant it the proper capabilities.  
-Note that this comes with security implications—user beware.
+### Advanced Permissions with Capabilities (Optional)
 
-```bash
-sudo setcap cap_chown+ep slink
-```
+In some setups, you might run `slink` as your regular user, but need it to create files/directories owned by a different user/group (e.g., the user your web server runs as, like `www-data`). Directly using `sudo` or SETUID for `slink` can cause issues with accessing the user-specific configuration file (`~/.config/slink/slink.conf`).
+
+A more robust solution is to use Linux capabilities. This grants the `slink` binary specific privileges without changing the user it runs as.
+
+1.  **Ensure `base_dir` Permissions:** The directory specified as `base_dir` in your configuration must be writable by the group `slink` will run under, and ideally owned by the target web user/group. It should also have the SETGID bit set so that new directories created inside it inherit the correct group ownership.
+    ```bash
+    # Example: Make base_dir owned by www-data:yourgroup, writable by group, with SETGID
+    sudo chown www-data:yourgroup /var/www/dump
+    sudo chmod g+w,g+s /var/www/dump # Results in permissions like 2770 (rwxrws---)
+    ```
+    Replace `yourgroup` with the group the user running `slink` belongs to, and `/var/www/dump` with your actual `base_dir`. The `web_user` (`www-data` in this example) and `web_group` (`yourgroup`) should match your `slink.conf`.
+
+2.  **Grant Capabilities:** Use `setcap` to grant `slink` the ability to change file ownership (`cap_chown`) and bypass file permission checks (`cap_dac_override`) when necessary. Replace `/path/to/slink` with the actual path to your installed binary (e.g., `$(which slink)` or `/home/user/.cargo/bin/slink`).
+    ```bash
+    sudo setcap cap_chown,cap_dac_override+eip /path/to/slink
+    ```
+    *   `cap_chown`: Allows changing file user/group ownership.
+    *   `cap_dac_override`: Allows bypassing file read, write, and execute permission checks.
+    *   `+eip`: Applies these capabilities to the Effective, Inheritable, and Permitted sets.
+
+3.  **(Optional) Verify Capabilities:**
+    ```bash
+    getcap /path/to/slink
+    # Expected output: /path/to/slink = cap_chown,cap_dac_override+eip
+    ```
+
+With this setup, `slink` runs as your user (accessing your config/db) but can create directories in `base_dir` and set their ownership to the configured `web_user` and `web_group`.
+
+**Security Note:** Granting capabilities reduces the security surface compared to running as root or using SETUID, but still provides elevated privileges. Understand the implications before applying them.
 
 ## Configuration
 
@@ -102,6 +128,26 @@ slink share alice@example.com document.pdf
 # http://localhost:8080/KJh8h7G6dT/document.pdf
 ```
 
+You can also create shares that expire after a certain duration using the `--expires-in` (or `-e`) flag. The duration format accepts units like `s`, `m`, `h`, `d`.
+
+```bash
+# Share for 1 hour
+slink share alice@example.com document.pdf --expires-in 1h
+# Shared document.pdf with alice@example.com:
+# http://localhost:8080/aBcDeFgH/document.pdf (Expires in 1 hour)
+```
+
+Additionally, you can specify that the underlying file should be deleted when the share expires using `--delete-file-on-expiry`. This only happens if it's the *last active share* for that file. This flag requires `--expires-in`.
+
+```bash
+# Share for 5 minutes, then delete the file (if no other shares exist)
+slink share bob@example.com sensitive.dat -e 5m --delete-file-on-expiry
+# Shared sensitive.dat with bob@example.com:
+# http://localhost:8080/xYz123Ab/sensitive.dat (Expires in 5 minutes, file will be deleted)
+```
+
+**Note:** Expired shares are removed by the `slink cleanup` command, which needs to be run periodically (see "Automatic Cleanup" section below).
+
 ### Add and Share in One Step
 You can add a file and immediately share it using the `-s` flag:
 
@@ -111,6 +157,13 @@ slink add document.pdf -s alice@example.com
 # Added file with UUID: 09d1cc19-1efe-42f2-9292-a33e60d44de5
 # Shared document.pdf with alice@example.com:
 # http://localhost:8080/KJh8h7G6dT/document.pdf
+```
+
+The `--expires-in` (`-e`) and `--delete-file-on-expiry` flags can also be used here, just like with the `share` command, to set an expiry for the initial share created with `-s`.
+
+```bash
+# Add and share for 10 minutes, then delete the file
+slink add report.docx -s reviewer@corp.com -e 10m --delete-file-on-expiry
 ```
 
 ### Show File Information
@@ -246,6 +299,77 @@ Once configured (and optionally installed), you can use the script like this:
     ```
 
 The script requires the `-h <host>` flag if the configuration file has not been created using `sl init`.
+
+### Cleanup Expired Shares
+The `cleanup` command processes expired shares, removing their symlinks and updating the database. If a share was created with `--delete-file-on-expiry` and it was the last active share for the file, this command will also delete the file itself.
+
+```bash
+slink cleanup
+# Starting cleanup of expired shares...
+#  Expiring share for UUID (recipient: ...)
+#  ...
+# Processed 1 expired shares.
+# Checking 1 files for potential deletion...
+#  File UUID has no remaining active shares. Attempting deletion...
+#   Successfully removed file directory /var/www/UUID
+#   Successfully removed file record UUID from database.
+# Cleanup finished. Expired shares processed: 1. Files deleted: 1.
+```
+
+This command is intended to be run periodically by a scheduler (see below).
+
+## Automatic Cleanup (Scheduling)
+
+Since `slink` does not run as a long-running process, the `slink cleanup` command must be executed periodically by an external scheduler like `systemd-timers` or `cron` to automatically remove expired shares and files.
+
+**Using systemd-timers (Recommended):**
+
+1.  **Create a service file** (e.g., `/etc/systemd/system/slink-cleanup.service`):
+    ```ini
+    [Unit]
+    Description=Slink Expired Share Cleanup
+    After=network.target
+
+    [Service]
+    Type=oneshot
+    User=<user_running_slink>  # Replace with the user who runs slink commands
+    Group=<group_of_user> # Replace with the primary group of the user
+    ExecStart=/path/to/slink cleanup # Replace with the actual path to your slink binary
+    ```
+
+2.  **Create a timer file** (e.g., `/etc/systemd/system/slink-cleanup.timer`):
+    ```ini
+    [Unit]
+    Description=Run slink cleanup every 5 minutes
+
+    [Timer]
+    OnBootSec=5min
+    OnUnitActiveSec=5min # Run 5 minutes after the last run
+    Unit=slink-cleanup.service
+
+    [Install]
+    WantedBy=timers.target
+    ```
+
+3.  **Enable and start the timer:**
+    ```bash
+    sudo systemctl enable slink-cleanup.timer
+    sudo systemctl start slink-cleanup.timer
+    # Check status: sudo systemctl list-timers slink-cleanup.timer
+    ```
+
+**Using cron:**
+
+Edit the crontab for the user running `slink`:
+```bash
+crontab -e
+```
+
+Add a line to run the cleanup command (e.g., every 5 minutes):
+```cron
+*/5 * * * * /path/to/slink cleanup > /dev/null 2>&1 # Replace with actual path
+```
+Make sure the `slink` binary is in the user's `$PATH` or provide the full path. Redirecting output (`> /dev/null 2>&1`) is optional but recommended for cron jobs.
 
 ## Web Server Configuration
 

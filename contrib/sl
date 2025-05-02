@@ -35,6 +35,8 @@ usage() {
   echo "Options for 'add':"
   echo "  -s <email>: Recipient email (required for sharing)"
   echo "  -n <name>:  Remote filename (defaults to local filename)"
+  echo "  -e <dur>:   Set expiry duration (e.g., 1h, 7d). Passed to slink as --expires-in."
+  echo "  -d:         Delete file on expiry. Passed to slink as --delete-file-on-expiry."
   echo "  -h <host>:  Override remote server. $server_info"
   echo ""
   echo "Options for 'ls' and 'rm':"
@@ -90,14 +92,18 @@ do_add() {
   local remote_name=""
   local local_file=""
   local host_override="" # Variable to store host from -h
+  local expires_in=""    # Variable for expiry duration
+  local delete_arg=""    # Variable to store the delete flag argument for slink
 
   # Parse options specific to 'add'
   OPTIND=1 # Reset OPTIND for getopts in function
-  while getopts "s:n:h:" opt; do
+  while getopts "s:n:h:e:d" opt; do
     case $opt in
       s) recipient="$OPTARG" ;;
       n) remote_name="$OPTARG" ;;
       h) host_override="$OPTARG" ;; # Store -h value
+      e) expires_in="$OPTARG" ;;   # Store expiry duration
+      d) delete_arg="--delete-file-on-expiry" ;; # Set delete flag argument
       \?) usage ;;
       :) echo "Option -$OPTARG requires an argument." >&2; usage ;;
     esac
@@ -123,7 +129,26 @@ do_add() {
 
   # Execution for 'add'
   echo "Sharing '$local_file' as '$remote_name' with '$recipient' via '$SLINK_SERVER'..."
-  cat "$local_file" | ssh "$SLINK_SERVER" slink add - -n "$remote_name" -s "$recipient"
+
+  # Build the slink command arguments dynamically
+  slink_args=()
+  slink_args+=("add")
+  slink_args+=("-") # Read from stdin
+  slink_args+=("-n" "$remote_name")
+  slink_args+=("-s" "$recipient")
+  if [[ -n "$expires_in" ]]; then
+    slink_args+=("--expires-in" "$expires_in")
+    echo "  (Expires in: $expires_in)"
+  fi
+  if [[ -n "$delete_arg" ]]; then
+    slink_args+=("$delete_arg")
+    echo "  (Will be deleted on expiry)"
+  fi
+
+  # Execute the command
+  # Use printf "%q " to safely quote arguments for ssh
+  cmd_str=$(printf "%q " "${slink_args[@]}")
+  cat "$local_file" | ssh "$SLINK_SERVER" "slink $cmd_str"
   local status=$?
   if [[ $status -ne 0 ]]; then
     echo "Error: Failed to share file via ssh and slink (exit code: $status)." >&2

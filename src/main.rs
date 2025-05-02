@@ -1,7 +1,8 @@
 // src/main.rs
 mod commands;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc}; // Added Duration
 use dirs::config_dir;
+use humantime::parse_duration; // Added for duration parsing
 use rusqlite::{params, Connection};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as b64, Engine as _};
 use serde::{Deserialize, Serialize};
@@ -95,12 +96,40 @@ enum Opt {
         #[structopt(short = "n", long = "name")]
         name: Option<String>,
         #[structopt(short = "s", long = "share")]
-        share: Option<String>,
+        share: Option<String>, // Recipient email
+
+        #[structopt(
+            long,
+            short = "e",
+            help = "Set expiry for the initial share (requires -s/--share)",
+            requires = "share" // Only relevant if -s is used
+        )]
+        expires_in: Option<String>,
+
+        #[structopt(
+            long,
+            help = "Delete file when the initial share expires (requires -s/--share and --expires-in)",
+            requires = "share" // Only relevant if -s is used
+        )]
+        delete_file_on_expiry: bool,
     },
     #[structopt(name = "share")]
     Share {
         recipient: String,
         file: String,
+
+        #[structopt(
+            long,
+            short = "e",
+            help = "Set an expiry duration for the share (e.g., '5m', '1h', '2d')"
+        )]
+        expires_in: Option<String>,
+
+        #[structopt(
+            long,
+            help = "Delete the file when this share expires (requires --expires-in)"
+        )]
+        delete_file_on_expiry: bool,
     },
     #[structopt(name = "unshare")]
     Unshare {
@@ -121,6 +150,8 @@ enum Opt {
     },
     #[structopt(name = "info")]
     Info,
+    #[structopt(name = "cleanup", about = "Clean up expired shares and optionally files")]
+    Cleanup,
 }
 
 struct FileShare {
@@ -135,6 +166,8 @@ struct ShareInfo {
     date_shared: DateTime<Utc>,
     date_removed: Option<DateTime<Utc>>,
     active: bool,
+    expires_at: Option<DateTime<Utc>>, // Added
+    delete_file_on_expiry: bool,      // Added
 }
 
 impl Config {
@@ -202,6 +235,8 @@ fn init_database(db_path: &str) -> Result<()> {
             date_shared DATETIME NOT NULL,
             date_removed DATETIME,
             active BOOLEAN NOT NULL DEFAULT 1,
+            expires_at DATETIME NULL,                     -- When the share expires (NULL for no expiry)
+            delete_file_on_expiry BOOLEAN NOT NULL DEFAULT 0, -- Delete file when this share expires?
             PRIMARY KEY (uuid, recipient),
             FOREIGN KEY (uuid) REFERENCES files(uuid)
         )",
@@ -267,7 +302,7 @@ fn set_permissions_recursive(
     Ok(())
 }
 
-fn remove_file_with_access(path: &Path) -> Result<()> {
+pub fn remove_file_with_access(path: &Path) -> Result<()> { // Added pub
     // Get current user's UID and GID
     let current_uid = nix::unistd::getuid();
     let current_gid = nix::unistd::getgid();
@@ -355,7 +390,14 @@ impl FileShare {
 }
 
 impl ShareInfo {
-    fn share(conn: &Connection, config: &Config, uuid: &str, recipient: &str) -> Result<String> {
+    fn share(
+        conn: &Connection,
+        config: &Config,
+        uuid: &str,
+        recipient: &str,
+        expires_at: Option<DateTime<Utc>>, // Added
+        delete_file_on_expiry: bool,      // Added
+    ) -> Result<String> {
         let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret, config.hash_bytes)?;
 
         // Create symlink with relative path
@@ -368,9 +410,16 @@ impl ShareInfo {
 
         // Use REPLACE INTO or INSERT OR REPLACE to handle existing shares
         conn.execute(
-            "INSERT OR REPLACE INTO shares (uuid, recipient, share_hash, date_shared, active)
-             VALUES (?1, ?2, ?3, ?4, 1)",
-            params![uuid, recipient, share_hash, Utc::now()],
+            "INSERT OR REPLACE INTO shares (uuid, recipient, share_hash, date_shared, active, expires_at, delete_file_on_expiry)
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)", // Added ?5, ?6
+            params![
+                uuid,
+                recipient,
+                share_hash,
+                Utc::now(),
+                expires_at, // Added
+                delete_file_on_expiry, // Added
+            ],
         )?;
 
         Ok(share_hash)
@@ -397,8 +446,8 @@ impl ShareInfo {
 
     fn get_shares(conn: &Connection, uuid: &str) -> Result<Vec<ShareInfo>> {
         let mut stmt = conn.prepare(
-            "SELECT recipient, share_hash, date_shared, date_removed, active 
-             FROM shares WHERE uuid = ?"
+            "SELECT recipient, share_hash, date_shared, date_removed, active, expires_at, delete_file_on_expiry
+             FROM shares WHERE uuid = ?" // Added expires_at, delete_file_on_expiry
         )?;
 
         let shares = stmt.query_map([uuid], |row| {
@@ -408,6 +457,8 @@ impl ShareInfo {
                 date_shared: row.get(2)?,
                 date_removed: row.get(3)?,
                 active: row.get(4)?,
+                expires_at: row.get(5)?, // Added
+                delete_file_on_expiry: row.get(6)?, // Added
             })
         })?;
 
@@ -429,14 +480,50 @@ fn main() -> Result<()> {
 
     // Match and execute other commands
     match opt {
-        Opt::Add { file, name, share } => {
+        Opt::Add { file, name, share, expires_in, delete_file_on_expiry } => { // Added expires_in, delete_file_on_expiry
             let uuid = commands::add_file(&config, &file, name)?;
             if let Some(recipient) = share {
-                commands::share_file(&config, &recipient, &uuid)?;
+                // --- Start: Added expiry logic for 'add -s' ---
+                // Validate flags (only if -s is used)
+                if delete_file_on_expiry && expires_in.is_none() {
+                     return Err(anyhow!("--delete-file-on-expiry requires --expires-in when using --share (-s)"));
+                }
+
+                // Parse duration and calculate expiry time (only if -s is used)
+                let expires_at: Option<DateTime<Utc>> = if let Some(duration_str) = expires_in {
+                    let std_duration = parse_duration(&duration_str)
+                        .map_err(|e| anyhow!("Invalid duration format '{}': {}", duration_str, e))?;
+                    let chrono_duration = Duration::from_std(std_duration)
+                        .map_err(|e| anyhow!("Duration conversion error: {}", e))?;
+                    Some(Utc::now() + chrono_duration)
+                } else {
+                    None
+                };
+                // --- End: Added expiry logic ---
+
+                // Call share_file with potentially calculated expiry info
+                commands::share_file(&config, &recipient, &uuid, expires_at, delete_file_on_expiry)?;
             }
         },
-        Opt::Share { recipient, file } => {
-            commands::share_file(&config, &recipient, &file)?;
+        Opt::Share { recipient, file, expires_in, delete_file_on_expiry } => {
+            // Validate flags
+            if delete_file_on_expiry && expires_in.is_none() {
+                return Err(anyhow!("--delete-file-on-expiry requires --expires-in to be set"));
+            }
+
+            // Parse duration and calculate expiry time
+            let expires_at: Option<DateTime<Utc>> = if let Some(duration_str) = expires_in {
+                let std_duration = parse_duration(&duration_str)
+                    .map_err(|e| anyhow!("Invalid duration format '{}': {}", duration_str, e))?;
+                let chrono_duration = Duration::from_std(std_duration)
+                    .map_err(|e| anyhow!("Duration conversion error: {}", e))?;
+                Some(Utc::now() + chrono_duration)
+            } else {
+                None
+            };
+
+            // Call the updated share_file function (signature needs changing next)
+            commands::share_file(&config, &recipient, &file, expires_at, delete_file_on_expiry)?;
         }
         Opt::Unshare { recipient, file } => {
             commands::unshare_file(&config, &recipient, &file)?;
@@ -455,6 +542,9 @@ fn main() -> Result<()> {
         }
         Opt::Init => {
             // This case is already handled above
+        }
+        Opt::Cleanup => {
+            commands::cleanup_expired_items(&config)?;
         }
     }
 

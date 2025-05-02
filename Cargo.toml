@@ -9,7 +9,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
 prettytable-rs = "0.10"
-rusqlite = { version = "0.33", features = ["chrono"] }
+# rusqlite = { version = "0.33", features = ["chrono"] } # Removed, replaced by sqlx
 serde = { version = "1.0", features = ["derive"] }
 structopt = "0.3"
 toml = "0.8"
@@ -19,3 +19,5 @@ users = "0.11.0"
 blake3 = "1.5.5"
 humantime = "2.1" # Added for parsing duration strings
 tempfile = "3.15.0"
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono"] } # Added for database connection and migrations
+tokio = { version = "1", features = ["full"] } # Added Tokio runtime dependency

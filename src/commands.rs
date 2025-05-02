@@ -1,13 +1,15 @@
 // src/commands.rs
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, NaiveDateTime}; // Added NaiveDateTime
 use prettytable::{Table, row};
-use rusqlite::{Connection, params};
+// Remove rusqlite: use rusqlite::{Connection, params};
+use sqlx::SqlitePool; // Removed Row
 use std::path::Path;
 use dirs::config_dir;
 use std::fs;
 use std::path::PathBuf;
-use crate::{init_database, create_dir_all, remove_file_with_access}; // Added remove_file_with_access
+// Remove init_database: use crate::{init_database, create_dir_all, remove_file_with_access};
+use crate::{create_dir_all, remove_file_with_access}; // Added remove_file_with_access
 use crate::{Config, FileShare, ShareInfo};
 use crate::Uuid;
 use crate::{Permissions, PermissionsExt, set_permissions, set_permissions_recursive};
@@ -15,6 +17,7 @@ use std::io::{self, Write, Read, BufReader, BufWriter};
 use std::collections::HashSet; // Added for cleanup logic
 use tempfile::NamedTempFile;
 
+// This function remains synchronous as it deals with initial setup before DB pool exists
 pub fn initialize_config() -> Result<()> {
     let config_dir = config_dir()
         .ok_or_else(|| anyhow!("Could not determine config directory"))?
@@ -96,16 +99,19 @@ pub fn initialize_config() -> Result<()> {
     set_permissions(&config_path, Permissions::from_mode(0o600))
         .map_err(|e| anyhow!("Failed to set permissions on config file {}: {}", config_path.display(), e))?;
 
-    // Initialize the database
-    create_dir_all(Path::new(&config.db_path).parent().unwrap())
-        .map_err(|e| anyhow!("Failed to create database directory: {}", e))?;
-    init_database(&config.db_path)
-        .map_err(|e| anyhow!("Failed to initialize database {}: {}", config.db_path, e))?;
+    // Ensure DB directory exists, but don't initialize DB (migrations handle this)
+    if let Some(parent) = Path::new(&config.db_path).parent() {
+        create_dir_all(parent)
+            .map_err(|e| anyhow!("Failed to create database directory {}: {}", parent.display(), e))?;
+    }
+    // Removed init_database call
 
     println!("Configuration saved to {}", config_path.display());
+    println!("Database will be created and migrated on first run.");
     Ok(())
 }
 
+// Synchronous helper
 fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
     print!("{} [{}]: ", prompt, default);
     io::stdout().flush()?;
@@ -115,6 +121,7 @@ fn prompt_with_default(prompt: &str, default: &str) -> Result<String> {
     Ok(if input.is_empty() { default.to_string() } else { input.to_string() })
 }
 
+// Synchronous helper
 fn prompt_with_validation<F>(prompt: &str, default: &str, validate: F) -> Result<String>
 where
     F: Fn(&str) -> Result<(), &str>,
@@ -129,11 +136,9 @@ where
     }
 }
 
-pub fn add_file(config: &Config, file_path: &str, name: Option<String>) -> Result<String> {
-    let conn = Connection::open(&config.db_path)?;
-
-    // Enable WAL mode for better concurrency
-    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+// Made async, takes pool
+pub async fn add_file(pool: &SqlitePool, config: &Config, file_path: &str, name: Option<String>) -> Result<String> {
+    // Removed Connection::open and WAL pragma
 
     // Sanitize and validate the provided name or get from file_path
     let filename = if let Some(name) = name {
@@ -175,10 +180,15 @@ pub fn add_file(config: &Config, file_path: &str, name: Option<String>) -> Resul
         &config.web_group,
     )?;
 
-    conn.execute(
+    // Use sqlx query
+    // Fix Utc::now() borrowing
+    let now_naive = Utc::now().naive_utc(); // Use NaiveDateTime for DB
+    sqlx::query!(
         "INSERT INTO files (uuid, filename, date_added) VALUES (?1, ?2, ?3)",
-        params![uuid, filename, Utc::now()],
-    )?;
+        uuid, filename, now_naive // Use NaiveDateTime
+    )
+    .execute(pool) // Use pool
+    .await?; // Use await
 
     println!("BLAKE3: {}", checksum);
     println!("Added file with UUID: {}", uuid);
@@ -186,6 +196,7 @@ pub fn add_file(config: &Config, file_path: &str, name: Option<String>) -> Resul
     Ok(uuid)
 }
 
+// Synchronous helper
 fn sanitize_filename(name: &str) -> Result<String> {
     let name = name.trim();
 
@@ -214,6 +225,7 @@ fn sanitize_filename(name: &str) -> Result<String> {
     Ok(name.to_string())
 }
 
+// Synchronous helper
 fn handle_stdin_upload(base_dir: &str, filename: &str) -> Result<(PathBuf, String)> {
     // Create temp file with prefix
     let temp_dir = PathBuf::from(base_dir);
@@ -258,6 +270,7 @@ fn handle_stdin_upload(base_dir: &str, filename: &str) -> Result<(PathBuf, Strin
     Ok((new_name, hasher.finalize().to_hex().to_string()))
 }
 
+// Synchronous helper
 fn calculate_file_hash(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -274,51 +287,65 @@ fn calculate_file_hash(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-pub fn share_file(
+// Made async, takes pool
+pub async fn share_file(
+    pool: &SqlitePool, // Changed conn to pool
     config: &Config,
     recipient: &str,
     file_spec: &str,
-    expires_at: Option<DateTime<Utc>>, // Added
-    delete_file_on_expiry: bool,      // Added
+    expires_at_utc: Option<DateTime<Utc>>, // Changed name for clarity, still Utc from main
+    delete_file_on_expiry: bool,
 ) -> Result<()> {
-    let conn = Connection::open(&config.db_path)?;
-    let uuid = resolve_file_spec(&conn, file_spec)?;
+    // Removed Connection::open
+    let uuid = resolve_file_spec(pool, file_spec).await?; // Use pool and await
 
-    // Pass new arguments to ShareInfo::share (needs update next)
+    // Convert expires_at_utc to Option<NaiveDateTime> for ShareInfo::share
+    let expires_at_naive: Option<NaiveDateTime> = expires_at_utc.map(|dt| dt.naive_utc());
+
+    // Call async ShareInfo::share with NaiveDateTime
     let share_hash = ShareInfo::share(
-        &conn,
+        pool, // Use pool
         config,
         &uuid,
         recipient,
-        expires_at,
+        expires_at_naive, // Pass NaiveDateTime
         delete_file_on_expiry,
-    )?;
-    let file = FileShare::find_by_uuid(&conn, &uuid)?.ok_or_else(|| anyhow!("File not found"))?;
+    ).await?; // Use await
+
+    // Call async FileShare::find_by_uuid
+    let file = FileShare::find_by_uuid(pool, &uuid).await? // Use pool and await
+        .ok_or_else(|| anyhow!("File not found after resolving spec"))?;
 
     println!("Shared {} with {}:", file.filename, recipient);
     println!("{}/{}/{}", config.base_url, share_hash, file.filename);
     Ok(())
 }
 
-pub fn unshare_file(config: &Config, recipient: &str, file_spec: &str) -> Result<()> {
-    let conn = Connection::open(&config.db_path)?;
-    let uuid = resolve_file_spec(&conn, file_spec)?;
+// Made async, takes pool
+pub async fn unshare_file(pool: &SqlitePool, config: &Config, recipient: &str, file_spec: &str) -> Result<()> {
+    // Removed Connection::open
+    let uuid = resolve_file_spec(pool, file_spec).await?; // Use pool and await
 
-    ShareInfo::unshare(&conn, config, &uuid, recipient)?;
+    // Call async ShareInfo::unshare
+    ShareInfo::unshare(pool, config, &uuid, recipient).await?; // Use pool and await
     println!("Removed share for {} from {}", file_spec, recipient);
     Ok(())
 }
 
-pub fn show_file(config: &Config, file_spec: &str) -> Result<()> {
-    let conn = Connection::open(&config.db_path)?;
-    let uuid = resolve_file_spec(&conn, file_spec)?;
+// Made async, takes pool
+pub async fn show_file(pool: &SqlitePool, config: &Config, file_spec: &str) -> Result<()> {
+    // Removed Connection::open
+    let uuid = resolve_file_spec(pool, file_spec).await?; // Use pool and await
 
-    let file = FileShare::find_by_uuid(&conn, &uuid)?.ok_or_else(|| anyhow!("File not found"))?;
-    let shares = ShareInfo::get_shares(&conn, &uuid)?;
+    // Call async FileShare::find_by_uuid
+    let file = FileShare::find_by_uuid(pool, &uuid).await? // Use pool and await
+        .ok_or_else(|| anyhow!("File not found after resolving spec"))?;
+    // Call async ShareInfo::get_shares
+    let shares = ShareInfo::get_shares(pool, &uuid).await?; // Use pool and await
 
     println!("File: {}", file.filename);
     println!("UUID: {}", file.uuid);
-    println!("Added: {}", file.date_added.format("%Y-%m-%d %H:%M:%S"));
+    println!("Added: {}", file.date_added.format("%Y-%m-%d %H:%M:%S")); // NaiveDateTime formats directly
     println!("\nShares:");
 
     let mut table = Table::new();
@@ -327,16 +354,16 @@ pub fn show_file(config: &Config, file_spec: &str) -> Result<()> {
     for share in shares {
         let status = if share.active { "Active" } else { "Removed" };
         let removed = share.date_removed.map_or("-".to_string(),
-            |d| d.format("%Y-%m-%d %H:%M:%S").to_string());
+            |d| d.format("%Y-%m-%d %H:%M:%S").to_string()); // NaiveDateTime formats directly
         let expires = share.expires_at.map_or("-".to_string(), // Added expires formatting
-            |d| d.format("%Y-%m-%d %H:%M:%S").to_string());
+            |d| d.format("%Y-%m-%d %H:%M:%S").to_string()); // NaiveDateTime formats directly
         let delete_on_expiry = if share.delete_file_on_expiry { "Yes" } else { "No" }; // Added delete flag formatting
         let url = format!("{}/{}/{}", config.base_url, share.share_hash, file.filename);
 
         table.add_row(row![
             share.recipient,
             status,
-            share.date_shared.format("%Y-%m-%d %H:%M:%S"),
+            share.date_shared.format("%Y-%m-%d %H:%M:%S"), // NaiveDateTime formats directly
             removed,
             expires, // Added expires
             delete_on_expiry, // Added delete flag
@@ -348,47 +375,40 @@ pub fn show_file(config: &Config, file_spec: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn list_files(config: &Config) -> Result<()> {
-    let conn = Connection::open(&config.db_path)?;
-    let mut stmt = conn.prepare(
-        "SELECT
-            f.uuid,
-            f.filename,
-            f.date_added,
-            COUNT(CASE WHEN s.active = 1 THEN s.uuid END) as active_share_count,
-            COUNT(CASE WHEN s.active = 1 AND s.expires_at IS NOT NULL THEN s.uuid END) as expiring_share_count,
-            COUNT(CASE WHEN s.active = 1 AND s.expires_at IS NOT NULL AND s.delete_file_on_expiry = 1 THEN s.uuid END) as deleting_share_count
-         FROM files f
-         LEFT JOIN shares s ON f.uuid = s.uuid
-         GROUP BY f.uuid, f.filename, f.date_added -- Ensure correct grouping
-         ORDER BY f.date_added DESC"
-    )?;
+// Made async, takes pool
+pub async fn list_files(pool: &SqlitePool, _config: &Config) -> Result<()> { // Prefix unused config
+    // Removed Connection::open
+
+    // Use sqlx query
+    let rows = sqlx::query!(
+        r#"
+         SELECT
+             f.uuid,
+             f.filename,
+             f.date_added,
+             COUNT(CASE WHEN s.active = 1 THEN s.uuid END) as "active_share_count!", -- ! needed for non-Option count
+             COUNT(CASE WHEN s.active = 1 AND s.expires_at IS NOT NULL THEN s.uuid END) as "expiring_share_count!",
+             COUNT(CASE WHEN s.active = 1 AND s.expires_at IS NOT NULL AND s.delete_file_on_expiry = 1 THEN s.uuid END) as "deleting_share_count!"
+          FROM files f
+          LEFT JOIN shares s ON f.uuid = s.uuid
+          GROUP BY f.uuid, f.filename, f.date_added
+          ORDER BY f.date_added DESC
+        "#
+    )
+    .fetch_all(pool) // Use pool
+    .await?; // Use await
 
     let mut table = Table::new();
-    // Added "Expiring" and "Deletes File" columns
     table.add_row(row!["Filename", "UUID", "Added", "Active Shares", "Expiring", "Deletes File"]);
 
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?, // uuid
-            row.get::<_, String>(1)?, // filename
-            row.get::<_, DateTime<Utc>>(2)?, // date_added
-            row.get::<_, i64>(3)?, // active_share_count
-            row.get::<_, i64>(4)?, // expiring_share_count
-            row.get::<_, i64>(5)?  // deleting_share_count
-        ))
-    })?;
-
     for row in rows {
-        // Unpack the new counts
-        let (uuid, filename, date_added, active_share_count, expiring_share_count, deleting_share_count) = row?;
         table.add_row(row![
-            filename,
-            uuid,
-            date_added.format("%Y-%m-%d %H:%M:%S"),
-            active_share_count,
-            expiring_share_count, // Add expiring count
-            deleting_share_count  // Add deleting count
+            row.filename,
+            row.uuid,
+            row.date_added.format("%Y-%m-%d %H:%M:%S"), // NaiveDateTime formats directly
+            row.active_share_count, // Already i64 from COUNT
+            row.expiring_share_count, // Already i64 from COUNT
+            row.deleting_share_count  // Already i64 from COUNT
         ]);
     }
 
@@ -396,18 +416,25 @@ pub fn list_files(config: &Config) -> Result<()> {
     Ok(())
 }
 
-pub fn remove_file(config: &Config, file_spec: &str, force: bool) -> Result<()> {
-    let conn = Connection::open(&config.db_path)?;
-    let uuid = resolve_file_spec(&conn, file_spec)?;
+// Made async, takes pool
+pub async fn remove_file(pool: &SqlitePool, config: &Config, file_spec: &str, force: bool) -> Result<()> {
+    // Removed Connection::open
+    let uuid = resolve_file_spec(pool, file_spec).await?; // Use pool and await
 
-    if let Some(file) = FileShare::find_by_uuid(&conn, &uuid)? {
-        file.remove(&conn, config, force)?;
+    // Call async FileShare::find_by_uuid
+    if let Some(file) = FileShare::find_by_uuid(pool, &uuid).await? { // Use pool and await
+        // Call async file.remove
+        file.remove(pool, config, force).await?; // Use pool and await
         println!("Removed file: {}", file.filename);
+    } else {
+        // This case might be unreachable if resolve_file_spec works correctly
+         println!("File '{}' not found or already removed.", file_spec);
     }
     Ok(())
 }
 
-fn resolve_file_spec(conn: &Connection, file_spec: &str) -> Result<String> {
+// Made async, takes pool
+async fn resolve_file_spec(pool: &SqlitePool, file_spec: &str) -> Result<String> {
     // If input looks like a UUID, use it directly
     if file_spec.len() == 36 && file_spec.chars().filter(|c| *c == '-').count() == 4 {
         return Ok(file_spec.to_string());
@@ -422,7 +449,8 @@ fn resolve_file_spec(conn: &Connection, file_spec: &str) -> Result<String> {
         _ => return Err(anyhow!("Invalid file specification")),
     };
 
-    let matches = FileShare::find_by_name(conn, filename)?;
+    // Call async FileShare::find_by_name
+    let matches = FileShare::find_by_name(pool, filename).await?; // Use pool and await
 
     if matches.is_empty() {
         return Err(anyhow!("File not found: {}", filename));
@@ -431,8 +459,8 @@ fn resolve_file_spec(conn: &Connection, file_spec: &str) -> Result<String> {
     if matches.len() > 1 && parts.len() == 1 {
         println!("Multiple files found:");
         for (i, (uuid, date)) in matches.iter().enumerate() {
-            println!("{}/{}: {} ({})", filename, i + 1, uuid, 
-                    date.format("%Y-%m-%d %H:%M:%S"));
+            println!("{}/{}: {} ({})", filename, i + 1, uuid,
+                    date.format("%Y-%m-%d %H:%M:%S")); // NaiveDateTime formats directly
         }
         return Err(anyhow!("Please specify file index"));
     }
@@ -442,7 +470,8 @@ fn resolve_file_spec(conn: &Connection, file_spec: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("Invalid file index"))
 }
 
-pub fn show_info(config: &Config) -> Result<()> {
+// Made async, takes pool
+pub async fn show_info(pool: &SqlitePool, config: &Config) -> Result<()> { // Added pool param
     println!("slink v{}", env!("CARGO_PKG_VERSION"));
     println!("\nConfiguration:");
 
@@ -458,7 +487,7 @@ pub fn show_info(config: &Config) -> Result<()> {
         println!("Base URL: {}", config.base_url);
         println!("Base directory: {}", config.base_dir);
         println!("Database path: {}", config.db_path);
-        println!("Hash secret: {}..[REDACTED]..{}", 
+        println!("Hash secret: {}..[REDACTED]..{}",
             &config.hash_secret[..2],
             &config.hash_secret[config.hash_secret.len()-2..]
         );
@@ -466,176 +495,183 @@ pub fn show_info(config: &Config) -> Result<()> {
         println!("Web group: {}", config.web_group);
         println!("Hash bytes: {} ({} bits of entropy)", config.hash_bytes, config.hash_bytes*8);
     } else {
-        println!("\nNo configuration file found. Default configuration will be created on first use.");
+        println!("\nNo configuration file found. Run `slink init` to create one.");
     }
 
-    // Database statistics
-    let db_path = Path::new(&config.db_path);
-    if db_path.exists() {
+    // Database statistics (only if DB file exists)
+    let db_path_str = &config.db_path;
+    if Path::new(db_path_str).exists() {
         println!("\nDatabase statistics:");
-        let conn = Connection::open(&config.db_path)?;
 
-        let file_count: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM files",
-            [],
-            |row| row.get(0)
-        )?;
+        // Use query_scalar! for single value results
+        // Change type to i32 for COUNT results
+        let file_count: i32 = sqlx::query_scalar!("SELECT COUNT(*) FROM files")
+            .fetch_one(pool)
+            .await?;
 
-        let total_shares: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM shares",
-            [],
-            |row| row.get(0)
-        )?;
+        let total_shares: i32 = sqlx::query_scalar!("SELECT COUNT(*) FROM shares")
+            .fetch_one(pool)
+            .await?;
 
-        let active_shares: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM shares WHERE active = 1",
-            [],
-            |row| row.get(0)
-        )?;
+        let active_shares: i32 = sqlx::query_scalar!("SELECT COUNT(*) FROM shares WHERE active = 1")
+            .fetch_one(pool)
+            .await?;
 
-        // Handle NULL case explicitly for oldest file
-        let oldest_file: String = if file_count > 0 {
-            conn.query_row(
-                "SELECT date_added FROM files ORDER BY date_added ASC LIMIT 1",
-                [],
-                |row| row.get::<_, DateTime<Utc>>(0)
-            ).map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())?
-        } else {
-            "No files".to_string()
-        };
+        // Handle NULL case explicitly for oldest file using fetch_optional
+        // Change type to Option<NaiveDateTime>
+        let oldest_file_dt: Option<NaiveDateTime> = sqlx::query_scalar!(
+                "SELECT date_added FROM files ORDER BY date_added ASC LIMIT 1"
+            )
+            .fetch_optional(pool)
+            .await?;
+
+        let oldest_file_str = oldest_file_dt
+            .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()) // NaiveDateTime formats directly
+            .unwrap_or_else(|| "-".to_string());
+
 
         println!("Total files: {}", file_count);
         println!("Total shares: {}", total_shares);
         println!("Active shares: {}", active_shares);
-        println!("Oldest file: {}", oldest_file);
+        println!("Oldest file added: {}", oldest_file_str);
     } else {
-        println!("\nDatabase not initialized yet.");
+        println!("\nDatabase not found at {}. It will be created and migrated on first run.", config.db_path);
     }
 
     Ok(())
 }
 
 
-// New function to handle cleanup of expired items
-pub fn cleanup_expired_items(config: &Config) -> Result<()> {
-    println!("Starting cleanup of expired shares...");
-    let conn = Connection::open(&config.db_path)?;
-    let mut uuids_to_check_for_deletion = HashSet::new();
+// --- Cleanup Command ---
+
+// Structure to hold share details relevant for cleanup (can reuse)
+#[derive(sqlx::FromRow, Debug)] // Added Debug
+struct ExpiringShare {
+    uuid: String,
+    recipient: String,
+    share_hash: String,
+    expires_at: Option<NaiveDateTime>, // Changed to Option<NaiveDateTime>
+    delete_file_on_expiry: bool,
+}
+
+// Made async, takes pool
+pub async fn cleanup_expired(pool: &SqlitePool, config: &Config) -> Result<()> {
+    let now = Utc::now();
+    let now_naive = now.naive_utc(); // Use NaiveDateTime for DB comparison
+    println!("Running cleanup at {}...", now.format("%Y-%m-%d %H:%M:%S"));
+
+    // 1. Find expired shares using sqlx
+    let expired_shares = sqlx::query_as!(
+        ExpiringShare,
+        r#"
+        SELECT uuid, recipient, share_hash, expires_at, delete_file_on_expiry
+        FROM shares
+        WHERE active = 1 AND expires_at IS NOT NULL AND expires_at < ?
+        "#,
+        now_naive // Use NaiveDateTime for comparison
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut files_to_delete = HashSet::new(); // Track UUIDs of files to delete
     let mut expired_shares_count = 0;
     let mut files_deleted_count = 0;
 
-    // Step 1: Process Expired Shares
-    { // Scope for the prepared statement
-        let mut stmt = conn.prepare(
-            "SELECT uuid, recipient, share_hash, delete_file_on_expiry
-             FROM shares
-             WHERE active = 1 AND expires_at IS NOT NULL AND expires_at <= ?"
-        )?;
-        let now = Utc::now();
-        let expired_iter = stmt.query_map(params![now], |row| {
-            Ok((
-                row.get::<_, String>(0)?, // uuid
-                row.get::<_, String>(1)?, // recipient
-                row.get::<_, String>(2)?, // share_hash
-                row.get::<_, bool>(3)?,   // delete_file_on_expiry
-            ))
-        })?;
-
-        for expired_result in expired_iter {
-            match expired_result {
-                Ok((uuid, recipient, share_hash, delete_on_expiry)) => {
-                    expired_shares_count += 1;
-                    println!(" Expiring share for {} (recipient: {})", uuid, recipient);
-
-                    // Remove symlink
-                    let symlink_path = PathBuf::from(&config.base_dir).join(&share_hash);
-                    if symlink_path.exists() {
-                        if let Err(e) = fs::remove_file(&symlink_path) {
-                             eprintln!("  WARN: Failed to remove symlink {}: {}", symlink_path.display(), e);
-                             // Continue processing even if symlink removal fails
-                        }
-                    } else {
-                         eprintln!("  WARN: Symlink {} not found, skipping removal.", symlink_path.display());
-                    }
-
-                    // Update share record in DB
-                    if let Err(e) = conn.execute(
-                        "UPDATE shares SET active = 0, date_removed = ? WHERE uuid = ? AND recipient = ?",
-                        params![Utc::now(), uuid, recipient],
-                    ) {
-                         eprintln!("  ERROR: Failed to update share record for {}/{}: {}", uuid, recipient, e);
-                         // Continue processing other shares
-                         continue; // Skip adding to deletion check if DB update failed
-                    }
-
-                    // If marked, add UUID to the set for potential file deletion
-                    if delete_on_expiry {
-                        uuids_to_check_for_deletion.insert(uuid);
-                    }
-                }
-                Err(e) => {
-                    eprintln!(" ERROR: Failed to process an expired share row: {}", e);
-                    // Continue processing other shares
-                }
-            }
-        }
-    } // Statement goes out of scope here
-
-    if expired_shares_count > 0 {
-         println!(" Processed {} expired shares.", expired_shares_count);
-    } else {
-         println!(" No expired shares found.");
+    for share in &expired_shares {
+         expired_shares_count += 1;
+         println!(
+             "Found expired share for file {} (recipient: {}, expires: {})",
+             share.uuid, share.recipient, share.expires_at.map_or_else(|| "-".to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()) // Handle Option
+         );
+         if share.delete_file_on_expiry {
+             println!("  -> Marked file {} for deletion.", share.uuid);
+             files_to_delete.insert(share.uuid.clone());
+         }
     }
 
 
-    // Step 2: Attempt File Deletion for relevant UUIDs
-    if !uuids_to_check_for_deletion.is_empty() {
-        println!(" Checking {} files for potential deletion...", uuids_to_check_for_deletion.len());
-        for uuid in uuids_to_check_for_deletion {
-            // Check if any other active shares exist for this file
-            let active_shares_count: i64 = match conn.query_row(
-                "SELECT COUNT(*) FROM shares WHERE uuid = ? AND active = 1",
-                params![uuid],
-                |row| row.get(0),
-            ) {
-                Ok(count) => count,
-                Err(e) => {
-                    eprintln!("  ERROR: Failed to check active shares for file {}: {}", uuid, e);
-                    continue; // Skip deletion check for this file
-                }
-            };
+    if expired_shares.is_empty() && files_to_delete.is_empty() {
+        println!("No expired shares or files marked for deletion found.");
+        return Ok(());
+    }
 
-            if active_shares_count == 0 {
-                println!("  File {} has no remaining active shares. Attempting deletion...", uuid);
-                // No active shares left, proceed with file deletion
-                let file_dir_path = PathBuf::from(&config.base_dir).join(&uuid);
+    // 2. Deactivate expired shares and remove symlinks (in a transaction)
+    let mut tx = pool.begin().await?; // Start sqlx transaction
 
-                // Use remove_file_with_access to handle permissions and removal
-                if file_dir_path.exists() {
-                    if let Err(e) = remove_file_with_access(&file_dir_path) {
-                        eprintln!("   ERROR: Failed to remove file directory {}: {}", file_dir_path.display(), e);
-                        // Continue to attempt DB cleanup even if file removal fails
-                    } else {
-                         println!("   Successfully removed file directory {}", file_dir_path.display());
-                         files_deleted_count += 1;
-                    }
+    for share in &expired_shares {
+        // Remove symlink
+        let symlink_path = PathBuf::from(&config.base_dir).join(&share.share_hash);
+        if symlink_path.exists() {
+            if let Err(e) = fs::remove_file(&symlink_path) {
+                eprintln!("Warning: Failed to remove symlink {}: {}", symlink_path.display(), e);
+                // Log and continue
+            } else {
+                println!("Removed symlink: {}", symlink_path.display());
+            }
+        }
+
+        // Deactivate share in DB using sqlx
+        let deactivate_time = Utc::now().naive_utc(); // Use NaiveDateTime for DB
+        sqlx::query!(
+            "UPDATE shares SET active = 0, date_removed = ? WHERE uuid = ? AND recipient = ?",
+            deactivate_time, share.uuid, share.recipient
+        )
+        .execute(&mut *tx) // Execute within the transaction
+        .await?;
+        println!("Deactivated share for file {} (recipient: {})", share.uuid, share.recipient);
+    }
+
+    // 3. Delete files marked for deletion (if any)
+    for uuid_to_delete in &files_to_delete {
+        // Check if there are any *other* active shares for this file using sqlx
+        // Change type to i32 for COUNT result
+        let active_shares_count: i32 = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM shares WHERE uuid = ? AND active = 1",
+            uuid_to_delete
+        )
+        .fetch_one(&mut *tx) // Fetch within the transaction
+        .await?;
+
+        if active_shares_count == 0 {
+            println!("Proceeding with deletion of file {}", uuid_to_delete);
+            let file_dir = PathBuf::from(&config.base_dir).join(uuid_to_delete);
+
+            // Use remove_file_with_access for potentially permissioned files
+            if file_dir.exists() { // Check if dir exists before trying to remove
+                if let Err(e) = remove_file_with_access(&file_dir) {
+                     eprintln!("Error deleting file directory {}: {}", file_dir.display(), e);
+                     // Log and continue, transaction will rollback on error if not committed
                 } else {
-                     eprintln!("   WARN: File directory {} not found, skipping removal.", file_dir_path.display());
-                }
-
-
-                // Remove file record from DB
-                if let Err(e) = conn.execute("DELETE FROM files WHERE uuid = ?", params![uuid]) {
-                    eprintln!("   ERROR: Failed to delete file record {} from database: {}", uuid, e);
-                } else {
-                     println!("   Successfully removed file record {} from database.", uuid);
+                     println!("Deleted file directory: {}", file_dir.display());
+                     files_deleted_count += 1;
+                     // Also remove the file record from the 'files' table using sqlx
+                     sqlx::query!("DELETE FROM files WHERE uuid = ?", uuid_to_delete)
+                        .execute(&mut *tx) // Execute within the transaction
+                        .await?;
+                     println!("Removed file record {} from database.", uuid_to_delete);
                 }
             } else {
-                 println!("  File {} still has {} active shares, skipping deletion.", uuid, active_shares_count);
+                 println!("Warning: Directory {} not found, skipping deletion.", file_dir.display());
+                 // If directory doesn't exist, still try to remove DB record
+                 if let Err(e) = sqlx::query!("DELETE FROM files WHERE uuid = ?", uuid_to_delete)
+                    .execute(&mut *tx)
+                    .await {
+                     eprintln!("Error removing file record {} from database: {}", uuid_to_delete, e);
+                 } else {
+                     println!("Removed potentially orphaned file record {} from database.", uuid_to_delete);
+                 }
             }
+        } else {
+            println!(
+                "Skipping deletion of file {}: {} other active shares exist.",
+                uuid_to_delete, active_shares_count
+            );
         }
     }
 
-    println!(" Cleanup finished. Expired shares processed: {}. Files deleted: {}.", expired_shares_count, files_deleted_count);
+    // Commit transaction
+    tx.commit().await?; // Commit async transaction
+
+    println!("Cleanup finished. Expired shares processed: {}. Files deleted: {}.", expired_shares_count, files_deleted_count);
     Ok(())
 }

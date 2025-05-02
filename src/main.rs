@@ -1,9 +1,10 @@
 // src/main.rs
 mod commands;
-use chrono::{DateTime, Duration, Utc}; // Added Duration
+use chrono::{DateTime, Duration, Utc, NaiveDateTime}; // Added NaiveDateTime
 use dirs::config_dir;
-use humantime::parse_duration; // Added for duration parsing
-use rusqlite::{params, Connection};
+use humantime::parse_duration;
+// Remove rusqlite import: use rusqlite::{params, Connection};
+use sqlx::{sqlite::{SqlitePoolOptions, SqliteConnectOptions}, FromRow, SqlitePool}; // Added SqliteConnectOptions
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as b64, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
@@ -21,58 +22,7 @@ use uuid::Uuid;
 use anyhow::{anyhow, Result};
 use std::io::{self, Write};
 
-/*
-slink is a self-hosted file sharing  utility written in Rust that enables secure
-file sharing through unique URLs. The program  manages files on a web server and
-creates secure, recipient-specific sharing links.
-
-Core functionality:
-- Files are stored with UUIDs in a base directory (e.g., /var/www/UUID/filename)
-- Sharing links are created using keyed BLAKE3 of UUID + recipient identifier
-- File and share information is tracked in SQLite
-- Configuration stored in ~/.config/slink/slink.conf (TOML format)
-- Runs on the server side, managing files directly
-
-Command interface:
-- add: Copy file to managed directory with UUID
-- share: Create recipient-specific sharing link
-- unshare: Remove sharing link but retain history
-- show: Display file info and share status
-- ls: List all managed files
-- rm: Remove file and its shares
-
-File structure:
-- Original file: BASE_DIR/UUID/filename
-- Share links: BASE_DIR/HASH -> UUID (relative symlink)
-
-URL format:
-- Private: https://domain/UUID/filename
-- Shared: https://domain/HASH/filename
-
-Security considerations:
-- Runs as dedicated user with appropriate permissions
-- Web server must follow symlinks
-- BLAKE3 secret stored in config
-- Share history maintained in SQLite
-
-Database schema:
-- files: uuid, filename, date_added
-- shares: uuid, recipient, share_hash, date_shared, date_removed, active
-
-Configuration (slink.conf):
-- base_url: Web server URL
-- base_dir: File storage location
-- db_path: SQLite database path
-- hash_secret: Secret for hash generation
-- web_user: Owner of files
-- web_group: Group for web access
-- hash_bytes: Length of resulting hash before base64 encoding
-
-The program is  designed to be simple, secure, and  maintainable, following Unix
-philosophy of doing one thing well.  It integrates with existing web servers and
-provides a straightforward CLI for file sharing management.
-*/
-
+/* ... (comments remain the same) ... */
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Config {
@@ -154,20 +104,22 @@ enum Opt {
     Cleanup,
 }
 
+#[derive(FromRow, Debug)] // Added Debug
 struct FileShare {
     uuid: String,
     filename: String,
-    date_added: DateTime<Utc>,
+    date_added: NaiveDateTime, // Changed to NaiveDateTime for sqlx compatibility
 }
 
+#[derive(FromRow, Debug)] // Added Debug
 struct ShareInfo {
     recipient: String,
     share_hash: String,
-    date_shared: DateTime<Utc>,
-    date_removed: Option<DateTime<Utc>>,
+    date_shared: NaiveDateTime, // Changed to NaiveDateTime
+    date_removed: Option<NaiveDateTime>, // Changed to Option<NaiveDateTime>
     active: bool,
-    expires_at: Option<DateTime<Utc>>, // Added
-    delete_file_on_expiry: bool,      // Added
+    expires_at: Option<NaiveDateTime>, // Changed to Option<NaiveDateTime>
+    delete_file_on_expiry: bool,
 }
 
 impl Config {
@@ -183,7 +135,8 @@ impl Config {
         Ok(())
     }
 
-    fn load_or_create() -> Result<Self> {
+    // Made async, returns pool instead of config directly for now
+    async fn load_config_and_pool() -> Result<(Self, SqlitePool)> {
         let config_path = config_dir()
             .ok_or_else(|| anyhow!("Could not determine config directory"))?
             .join("slink")
@@ -204,47 +157,32 @@ impl Config {
             .map_err(|e| anyhow!("Failed to read config file {}: {}", config_path.display(), e))?;
         let config: Config = toml::from_str(&content)?;
 
-        if !Path::new(&config.db_path).join("shares.db").exists() {
-            // Try to initialize database
-            init_database(&config.db_path)
-                .map_err(|e| anyhow!("Failed to initialize database {}: {}", config.db_path, e))?;
+        // Ensure the directory for the database exists
+        if let Some(parent) = Path::new(&config.db_path).parent() {
+             if !parent.exists() {
+                 fs::create_dir_all(parent)?;
+             }
         }
-        Ok(config)
+
+        // Configure connection options to create the DB if missing
+        let connect_options = SqliteConnectOptions::new()
+            .filename(Path::new(&config.db_path))
+            .create_if_missing(true); // Add this line
+
+        // Establish connection pool using sqlx with the configured options
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5) // Example: configure pool size
+            .connect_with(connect_options) // Use connect_with and the options
+            .await?;
+            // .map_err(|e| anyhow!("Failed to connect to database {}: {}", config.db_path, e))?;
+
+        // Removed init_database call - migrations handle this
+
+        Ok((config, pool))
     }
-
-
 }
 
-fn init_database(db_path: &str) -> Result<()> {
-    let conn = Connection::open(db_path)?;
-
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS files (
-            uuid CHAR(36) NOT NULL PRIMARY KEY,
-            filename TEXT NOT NULL,
-            date_added DATETIME NOT NULL
-        )",
-        [],
-    )?;
-
-    conn.execute(
-       "CREATE TABLE IF NOT EXISTS shares (
-            uuid CHAR(36) NOT NULL,
-            recipient TEXT NOT NULL,
-            share_hash TEXT NOT NULL,
-            date_shared DATETIME NOT NULL,
-            date_removed DATETIME,
-            active BOOLEAN NOT NULL DEFAULT 1,
-            expires_at DATETIME NULL,                     -- When the share expires (NULL for no expiry)
-            delete_file_on_expiry BOOLEAN NOT NULL DEFAULT 0, -- Delete file when this share expires?
-            PRIMARY KEY (uuid, recipient),
-            FOREIGN KEY (uuid) REFERENCES files(uuid)
-        )",
-        [],
-    )?;
-
-    Ok(())
-}
+// Removed init_database function - migrations handle schema creation
 
 fn calculate_share_hash(uuid: &str, recipient: &str, secret: &str, hash_bytes: usize) -> Result<String> {
     let key = blake3::derive_key("slink", secret.as_bytes());
@@ -320,83 +258,91 @@ pub fn remove_file_with_access(path: &Path) -> Result<()> { // Added pub
 
 
 impl FileShare {
-    fn find_by_name(conn: &Connection, filename: &str) -> Result<Vec<(String, DateTime<Utc>)>> {
-        let mut stmt = conn.prepare(
-            "SELECT uuid, date_added FROM files WHERE filename = ? ORDER BY date_added"
-        )?;
+    // Made async, takes pool
+    // Adjusted return type and map for NaiveDateTime
+    async fn find_by_name(pool: &SqlitePool, filename: &str) -> Result<Vec<(String, NaiveDateTime)>> {
+        let results = sqlx::query!(
+            "SELECT uuid, date_added FROM files WHERE filename = ? ORDER BY date_added",
+            filename
+        )
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        // date_added is already NaiveDateTime from sqlx
+        .map(|row| (row.uuid, row.date_added))
+        .collect();
 
-        let results = stmt.query_map([filename], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?;
-
-        results.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        Ok(results)
     }
 
-    fn find_by_uuid(conn: &Connection, uuid: &str) -> Result<Option<FileShare>> {
-        let mut stmt = conn.prepare(
-            "SELECT filename, date_added FROM files WHERE uuid = ?"
-        )?;
+    // Made async, takes pool
+    async fn find_by_uuid(pool: &SqlitePool, uuid: &str) -> Result<Option<FileShare>> {
+         let result = sqlx::query_as!(
+            FileShare, // Use query_as! with the struct
+            "SELECT uuid, filename, date_added FROM files WHERE uuid = ?",
+            uuid
+        )
+        .fetch_optional(pool) // Use fetch_optional for Option result
+        .await?;
 
-        let mut rows = stmt.query([uuid])?;
-
-        if let Some(row) = rows.next()? {
-            Ok(Some(FileShare {
-                uuid: uuid.to_string(),
-                filename: row.get(0)?,
-                date_added: row.get(1)?,
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(result)
     }
 
-    fn remove(&self, conn: &Connection, config: &Config, force: bool) -> Result<()> {
-    if !force {
-        print!("Are you sure you want to remove {}? [y/N] ", self.filename);
-        io::stdout().flush()?;
-        let mut input = String::new();
-        io::stdin().read_line(&mut input)?;
-        if !input.trim().eq_ignore_ascii_case("y") {
-            return Ok(());
-        }
-    }
-
-    // Remove all symlinks
-    let shares_dir = PathBuf::from(&config.base_dir);
-    for entry in fs::read_dir(&shares_dir)? {
-        let entry = entry?;
-        if let Ok(target) = fs::read_link(entry.path()) {
-            if target.ends_with(&self.uuid) {
-                remove_file_with_access(&entry.path())?;
+    // Made async, takes pool
+    async fn remove(&self, pool: &SqlitePool, config: &Config, force: bool) -> Result<()> {
+        if !force {
+            print!("Are you sure you want to remove {}? [y/N] ", self.filename);
+            io::stdout().flush()?;
+            let mut input = String::new();
+            io::stdin().read_line(&mut input)?;
+            if !input.trim().eq_ignore_ascii_case("y") {
+                return Ok(());
             }
         }
+
+        // Remove all symlinks
+        let shares_dir = PathBuf::from(&config.base_dir);
+        for entry in fs::read_dir(&shares_dir)? {
+            let entry = entry?;
+            if let Ok(target) = fs::read_link(entry.path()) {
+                if target.ends_with(&self.uuid) {
+                    remove_file_with_access(&entry.path())?;
+                }
+            }
+        }
+
+        // Remove the file directory
+        let file_dir = PathBuf::from(&config.base_dir).join(&self.uuid);
+        remove_file_with_access(&file_dir)?;
+
+        // Update database using sqlx
+        // Fix Utc::now() borrowing
+        let now = Utc::now().naive_utc(); // Use NaiveDateTime for DB
+        sqlx::query!(
+            "UPDATE shares SET active = 0, date_removed = ? WHERE uuid = ?",
+            now, self.uuid
+        )
+        .execute(pool)
+        .await?;
+
+        sqlx::query!("DELETE FROM files WHERE uuid = ?", self.uuid)
+            .execute(pool)
+            .await?;
+
+        Ok(())
     }
-
-    // Remove the file directory
-    let file_dir = PathBuf::from(&config.base_dir).join(&self.uuid);
-    remove_file_with_access(&file_dir)?;
-
-    // Update database
-    conn.execute(
-        "UPDATE shares SET active = 0, date_removed = ? WHERE uuid = ?",
-        params![Utc::now(), self.uuid],
-    )?;
-
-    conn.execute("DELETE FROM files WHERE uuid = ?", [&self.uuid])?;
-
-    Ok(())
-}
 
 }
 
 impl ShareInfo {
-    fn share(
-        conn: &Connection,
+    // Made async, takes pool
+    async fn share(
+        pool: &SqlitePool, // Changed conn to pool
         config: &Config,
         uuid: &str,
         recipient: &str,
-        expires_at: Option<DateTime<Utc>>, // Added
-        delete_file_on_expiry: bool,      // Added
+        expires_at: Option<NaiveDateTime>, // Changed to NaiveDateTime
+        delete_file_on_expiry: bool,
     ) -> Result<String> {
         let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret, config.hash_bytes)?;
 
@@ -408,25 +354,26 @@ impl ShareInfo {
         }
         unix_symlink(uuid, source)?;
 
-        // Use REPLACE INTO or INSERT OR REPLACE to handle existing shares
-        conn.execute(
+        // Use sqlx query for INSERT OR REPLACE
+        let now_naive = Utc::now().naive_utc(); // Use NaiveDateTime for DB
+        sqlx::query!(
             "INSERT OR REPLACE INTO shares (uuid, recipient, share_hash, date_shared, active, expires_at, delete_file_on_expiry)
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)", // Added ?5, ?6
-            params![
-                uuid,
-                recipient,
-                share_hash,
-                Utc::now(),
-                expires_at, // Added
-                delete_file_on_expiry, // Added
-            ],
-        )?;
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6)",
+            uuid,
+            recipient,
+            share_hash,
+            now_naive, // Use NaiveDateTime
+            expires_at, // Already Option<NaiveDateTime>
+            delete_file_on_expiry,
+        )
+        .execute(pool) // Use pool
+        .await?; // Use await
 
         Ok(share_hash)
     }
 
-
-    fn unshare(conn: &Connection, config: &Config, uuid: &str, recipient: &str) -> Result<()> {
+    // Made async, takes pool
+    async fn unshare(pool: &SqlitePool, config: &Config, uuid: &str, recipient: &str) -> Result<()> {
         let share_hash = calculate_share_hash(uuid, recipient, &config.hash_secret, config.hash_bytes)?;
 
         // Remove symlink
@@ -435,119 +382,137 @@ impl ShareInfo {
             fs::remove_file(symlink)?;
         }
 
-        conn.execute(
-            "UPDATE shares SET active = 0, date_removed = ? 
+        // Use sqlx query for UPDATE
+        // Fix Utc::now() borrowing
+        let now = Utc::now().naive_utc(); // Use NaiveDateTime for DB
+        sqlx::query!(
+            "UPDATE shares SET active = 0, date_removed = ?
              WHERE uuid = ? AND recipient = ? AND active = 1",
-            params![Utc::now(), uuid, recipient],
-        )?;
+            now, uuid, recipient
+        )
+        .execute(pool) // Use pool
+        .await?; // Use await
 
         Ok(())
     }
 
-    fn get_shares(conn: &Connection, uuid: &str) -> Result<Vec<ShareInfo>> {
-        let mut stmt = conn.prepare(
+    // Made async, takes pool
+    async fn get_shares(pool: &SqlitePool, uuid: &str) -> Result<Vec<ShareInfo>> {
+        // Use query_as! to map directly to ShareInfo struct
+        let shares = sqlx::query_as!(
+            ShareInfo,
             "SELECT recipient, share_hash, date_shared, date_removed, active, expires_at, delete_file_on_expiry
-             FROM shares WHERE uuid = ?" // Added expires_at, delete_file_on_expiry
-        )?;
+             FROM shares WHERE uuid = ?",
+            uuid
+        )
+        .fetch_all(pool) // Use fetch_all
+        .await?; // Use await
 
-        let shares = stmt.query_map([uuid], |row| {
-            Ok(ShareInfo {
-                recipient: row.get(0)?,
-                share_hash: row.get(1)?,
-                date_shared: row.get(2)?,
-                date_removed: row.get(3)?,
-                active: row.get(4)?,
-                expires_at: row.get(5)?, // Added
-                delete_file_on_expiry: row.get(6)?, // Added
-            })
-        })?;
-
-        shares.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        Ok(shares)
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main] // Added tokio runtime
+async fn main() -> Result<()> { // Added async back
     let opt = Opt::from_args();
 
-    // Handle `slink init` command separately
+    // Handle `slink init` command separately (remains synchronous)
     if let Opt::Init = opt {
         commands::initialize_config()?;
+        // Consider if init should also ensure db dir exists
+        println!("Configuration initialized. Please review and edit ~/.config/slink/slink.conf");
         return Ok(());
     }
 
-    // For all other commands, load the configuration
-    let config = Config::load_or_create()?;
+    // For all other commands, load the configuration and establish DB pool
+    let (config, pool) = Config::load_config_and_pool().await?; // Use new async function
 
-    // Match and execute other commands
+    // --- Run Migrations ---
+    println!("Applying database migrations...");
+    sqlx::migrate!("./migrations") // Point to the migrations directory
+        .run(&pool)
+        .await
+        .map_err(|e| anyhow!("Database migration failed: {}", e))?;
+    println!("Migrations applied successfully.");
+    // --- End Migrations ---
+
+
+    // Match and execute other commands (now async)
     match opt {
-        Opt::Add { file, name, share, expires_in, delete_file_on_expiry } => { // Added expires_in, delete_file_on_expiry
-            let uuid = commands::add_file(&config, &file, name)?;
+        Opt::Add { file, name, share, expires_in, delete_file_on_expiry } => {
+            // Pass pool and await
+            let uuid = commands::add_file(&pool, &config, &file, name).await?;
+
             if let Some(recipient) = share {
-                // --- Start: Added expiry logic for 'add -s' ---
-                // Validate flags (only if -s is used)
                 if delete_file_on_expiry && expires_in.is_none() {
                      return Err(anyhow!("--delete-file-on-expiry requires --expires-in when using --share (-s)"));
                 }
-
-                // Parse duration and calculate expiry time (only if -s is used)
-                let expires_at: Option<DateTime<Utc>> = if let Some(duration_str) = expires_in {
+                // Calculate expires_at (DateTime<Utc>)
+                let expires_at_utc: Option<DateTime<Utc>> = if let Some(duration_str) = expires_in {
                     let std_duration = parse_duration(&duration_str)
                         .map_err(|e| anyhow!("Invalid duration format '{}': {}", duration_str, e))?;
                     let chrono_duration = Duration::from_std(std_duration)
                         .map_err(|e| anyhow!("Duration conversion error: {}", e))?;
-                    Some(Utc::now() + chrono_duration)
+                    Some(Utc::now() + chrono_duration) // Keep as Utc here for calculation
                 } else {
                     None
                 };
-                // --- End: Added expiry logic ---
 
-                // Call share_file with potentially calculated expiry info
-                commands::share_file(&config, &recipient, &uuid, expires_at, delete_file_on_expiry)?;
+                // Convert expires_at_utc to Option<NaiveDateTime> for ShareInfo::share
+                let expires_at_naive: Option<NaiveDateTime> = expires_at_utc.map(|dt| dt.naive_utc());
+
+                // Use the pool for sharing, passing the NaiveDateTime
+                // ShareInfo::share expects Option<NaiveDateTime> now
+                let share_hash = ShareInfo::share(&pool, &config, &uuid, &recipient, expires_at_naive, delete_file_on_expiry).await?;
+                let share_url = format!("{}/{}/{}", config.base_url, share_hash, PathBuf::from(&file).file_name().unwrap().to_str().unwrap());
+                println!("Share created for {}: {}", recipient, share_url);
             }
-        },
+        }
         Opt::Share { recipient, file, expires_in, delete_file_on_expiry } => {
-            // Validate flags
             if delete_file_on_expiry && expires_in.is_none() {
-                return Err(anyhow!("--delete-file-on-expiry requires --expires-in to be set"));
+                 return Err(anyhow!("--delete-file-on-expiry requires --expires-in"));
             }
-
-            // Parse duration and calculate expiry time
-            let expires_at: Option<DateTime<Utc>> = if let Some(duration_str) = expires_in {
+            // Calculate expires_at (DateTime<Utc>)
+            let expires_at_utc: Option<DateTime<Utc>> = if let Some(duration_str) = expires_in {
                 let std_duration = parse_duration(&duration_str)
                     .map_err(|e| anyhow!("Invalid duration format '{}': {}", duration_str, e))?;
                 let chrono_duration = Duration::from_std(std_duration)
                     .map_err(|e| anyhow!("Duration conversion error: {}", e))?;
-                Some(Utc::now() + chrono_duration)
+                Some(Utc::now() + chrono_duration) // Keep as Utc here for calculation
             } else {
                 None
             };
 
-            // Call the updated share_file function (signature needs changing next)
-            commands::share_file(&config, &recipient, &file, expires_at, delete_file_on_expiry)?;
+            // Call async command function, passing the calculated expires_at_utc
+            // commands::share_file expects Option<DateTime<Utc>>
+            commands::share_file(&pool, &config, &recipient, &file, expires_at_utc, delete_file_on_expiry).await?;
         }
         Opt::Unshare { recipient, file } => {
-            commands::unshare_file(&config, &recipient, &file)?;
+            // Call async command function
+            commands::unshare_file(&pool, &config, &recipient, &file).await?;
         }
         Opt::Show { file } => {
-            commands::show_file(&config, &file)?;
+            // Call async command function
+            commands::show_file(&pool, &config, &file).await?;
         }
         Opt::List => {
-            commands::list_files(&config)?;
+            // Call async command function
+            commands::list_files(&pool, &config).await?;
         }
         Opt::Remove { file, force } => {
-            commands::remove_file(&config, &file, force)?;
+            // Call async command function
+            commands::remove_file(&pool, &config, &file, force).await?;
         }
         Opt::Info => {
-            commands::show_info(&config)?;
-        }
-        Opt::Init => {
-            // This case is already handled above
+             // Call async command function
+             commands::show_info(&pool, &config).await?;
         }
         Opt::Cleanup => {
-            commands::cleanup_expired_items(&config)?;
+            // Call async command function
+            commands::cleanup_expired(&pool, &config).await?;
         }
+        Opt::Init => unreachable!(), // Already handled
     }
 
     Ok(())
 }
-

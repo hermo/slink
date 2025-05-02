@@ -470,7 +470,10 @@ async fn main() -> Result<()> { // Added async back
                 // Use the pool for sharing, passing the NaiveDateTime
                 // ShareInfo::share expects Option<NaiveDateTime> now
                 let share_hash = ShareInfo::share(&pool, &config, &uuid, &recipient, expires_at_naive, delete_file_on_expiry).await?;
-                let share_url = format!("{}/{}/{}", config.base_url, share_hash, PathBuf::from(&file).file_name().unwrap().to_str().unwrap());
+                // Fetch the actual filename associated with the UUID to construct the correct URL
+                let file_info = FileShare::find_by_uuid(&pool, &uuid).await?
+                    .ok_or_else(|| anyhow!("Failed to retrieve file info for UUID {} after adding", uuid))?;
+                let share_url = format!("{}/{}/{}", config.base_url, share_hash, file_info.filename);
                 println!("Share created for {}: {}", recipient, share_url);
             }
         }

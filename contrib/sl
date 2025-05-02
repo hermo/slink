@@ -1,0 +1,237 @@
+#!/bin/bash
+
+# --- Configuration ---
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/slink"
+CONFIG_FILE="$CONFIG_DIR/config"
+SLINK_SERVER="" # Will be loaded from config or -h flag
+
+# Function to load server from config
+load_config() {
+  if [[ -f "$CONFIG_FILE" ]]; then
+    # Basic check: read the first line as the server, trim whitespace
+    SLINK_SERVER=$(head -n 1 "$CONFIG_FILE" | tr -d '[:space:]')
+    # Add more robust parsing here if config format becomes complex
+  fi
+}
+
+# --- Usage Function ---
+usage() {
+  local cmd=$(basename "$0")
+  local server_info="Defaults to server in $CONFIG_FILE if set."
+
+  echo "Usage:"
+  echo "  $cmd init"
+  echo "  $cmd add [-s <recipient>] [-n <remote_name>] [-h <host>] <local_file>"
+  echo "  $cmd ls [-h <host>]"
+  echo "  $cmd rm [-h <host>] <filename_or_uuid>"
+  echo ""
+  echo "Commands:"
+  echo "  init   Configure the default slink server and save to $CONFIG_FILE."
+  echo "  add    Upload a local file, share it, and print the link."
+  echo "         (Default command if none is specified)"
+  echo "  ls     List files managed by slink on the server."
+  echo "  rm     Remove a file managed by slink on the server."
+  echo ""
+  echo "Options for 'add':"
+  echo "  -s <email>: Recipient email (required for sharing)"
+  echo "  -n <name>:  Remote filename (defaults to local filename)"
+  echo "  -h <host>:  Override remote server. $server_info"
+  echo ""
+  echo "Options for 'ls' and 'rm':"
+  echo "  -h <host>:  Override remote server. $server_info"
+  echo ""
+  echo "If no server is configured via 'init' or provided via '-h', the command will fail."
+  exit 1
+}
+
+# --- Command Functions ---
+
+do_init() {
+  local server
+  read -p "Enter the default slink server hostname: " server
+  server=$(echo "$server" | tr -d '[:space:]') # Trim whitespace
+
+  if [[ -z "$server" ]]; then
+    echo "Error: Server hostname cannot be empty." >&2
+    exit 1
+  fi
+
+  mkdir -p "$CONFIG_DIR"
+  if echo "$server" > "$CONFIG_FILE"; then
+    chmod 600 "$CONFIG_FILE" # Secure the config file
+    echo "Default server set to '$server' in $CONFIG_FILE"
+  else
+    echo "Error: Failed to write config file $CONFIG_FILE" >&2
+    exit 1
+  fi
+  exit 0
+}
+
+
+# Function to ensure server is set (either via config or -h)
+# Usage: ensure_server_set <host_override_value> <command_name>
+ensure_server_set() {
+    local host_override="$1"
+    local cmd_name="$2" # Pass command name for better error messages
+
+    if [[ -n "$host_override" ]]; then
+        SLINK_SERVER="$host_override"
+    elif [[ -z "$SLINK_SERVER" ]]; then # Check if loaded config was empty or file missing
+        echo "Error: Server host not specified for '$cmd_name'." >&2
+        echo "Use -h <host> or configure a default server with '$(basename "$0") init'." >&2
+        exit 1
+    fi
+    # If we reach here, SLINK_SERVER is set (either by override or config)
+}
+
+
+do_add() {
+  local recipient=""
+  local remote_name=""
+  local local_file=""
+  local host_override="" # Variable to store host from -h
+
+  # Parse options specific to 'add'
+  OPTIND=1 # Reset OPTIND for getopts in function
+  while getopts "s:n:h:" opt; do
+    case $opt in
+      s) recipient="$OPTARG" ;;
+      n) remote_name="$OPTARG" ;;
+      h) host_override="$OPTARG" ;; # Store -h value
+      \?) usage ;;
+      :) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+    esac
+  done
+  shift $((OPTIND-1))
+  local_file="$1"
+
+  # Ensure server is set
+  ensure_server_set "$host_override" "add"
+
+  # Validation for 'add'
+  if [[ -z "$recipient" || -z "$local_file" ]]; then
+    echo "Error: For 'add', recipient (-s) and local file path are required." >&2
+    usage
+  fi
+  if [[ ! -f "$local_file" ]]; then
+    echo "Error: Local file '$local_file' not found or is not a regular file." >&2
+    exit 1
+  fi
+  if [[ -z "$remote_name" ]]; then
+    remote_name=$(basename "$local_file")
+  fi
+
+  # Execution for 'add'
+  echo "Sharing '$local_file' as '$remote_name' with '$recipient' via '$SLINK_SERVER'..."
+  cat "$local_file" | ssh "$SLINK_SERVER" slink add - -n "$remote_name" -s "$recipient"
+  local status=$?
+  if [[ $status -ne 0 ]]; then
+    echo "Error: Failed to share file via ssh and slink (exit code: $status)." >&2
+    exit $status
+  fi
+  echo "File potentially shared successfully (check slink output above)."
+}
+
+do_ls() {
+  local host_override=""
+  # Parse options specific to 'ls'
+  OPTIND=1
+  while getopts "h:" opt; do
+    case $opt in
+      h) host_override="$OPTARG" ;;
+      \?) usage ;;
+      :) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+    esac
+  done
+  shift $((OPTIND-1))
+
+  if [[ -n "$1" ]]; then
+     echo "Error: 'ls' command does not take additional arguments." >&2
+     usage
+  fi
+
+  # Ensure server is set
+  ensure_server_set "$host_override" "ls"
+
+  # Execution for 'ls'
+  echo "Listing files on '$SLINK_SERVER'..."
+  ssh "$SLINK_SERVER" slink ls
+}
+
+do_rm() {
+  local target_file=""
+  local host_override=""
+  # Parse options specific to 'rm'
+  OPTIND=1
+  while getopts "h:" opt; do
+    case $opt in
+      h) host_override="$OPTARG" ;;
+      \?) usage ;;
+      :) echo "Option -$OPTARG requires an argument." >&2; usage ;;
+    esac
+  done
+  shift $((OPTIND-1))
+  target_file="$1"
+
+  # Ensure server is set
+  ensure_server_set "$host_override" "rm"
+
+  # Validation for 'rm'
+  if [[ -z "$target_file" ]]; then
+    echo "Error: 'rm' command requires a filename or UUID argument." >&2
+    usage
+  fi
+
+  # Execution for 'rm'
+  echo "Attempting to remove '$target_file' on '$SLINK_SERVER'..."
+  # Use -t to force pseudo-terminal allocation for the interactive prompt
+  ssh -t "$SLINK_SERVER" slink rm "$target_file"
+}
+
+# --- Main Logic ---
+
+# Load configuration first
+load_config # Sets SLINK_SERVER if config file exists and is readable
+
+# Determine command
+COMMAND=""
+if [[ -z "$1" ]]; then
+    # No arguments? Require a command.
+    usage
+fi
+
+# Handle 'init' command separately as it doesn't need server config check
+if [[ "$1" == "init" ]]; then
+  if [[ $# -gt 1 ]]; then
+      echo "Error: 'init' command does not take arguments." >&2
+      usage
+  fi
+  do_init
+  # do_init exits on its own
+fi
+
+
+# Determine command (default to 'add' if first arg doesn't match known commands and isn't an option)
+if [[ "$1" == "ls" || "$1" == "rm" ]]; then
+  COMMAND="$1"
+  shift # Remove command from arguments
+elif [[ "$1" =~ ^- ]] || [[ -n "$1" && "$1" != "ls" && "$1" != "rm" ]]; then
+  # First arg is an option OR it's not ls/rm/init -> assume 'add'
+  # We don't shift here because the first arg might be the filename for add
+  COMMAND="add"
+else
+    # If it's not init, ls, rm, or looks like args for add, it's an error
+    usage
+fi
+
+
+# Execute the chosen command function
+# Note: Server check (ensure_server_set) is now inside each do_* function
+case $COMMAND in
+  add) do_add "$@" ;;
+  ls)  do_ls "$@" ;;
+  rm)  do_rm "$@" ;;
+  *)   usage ;; # Should not happen
+esac
+
+exit 0

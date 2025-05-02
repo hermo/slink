@@ -207,6 +207,46 @@ pv document.pdf | ssh example.com slink add - -n "document.pdf"
 
 The BLAKE3 hash is printed after successful upload and can be used to verify file integrity.
 
+### Helper Script (`contrib/sl`)
+
+To simplify these remote operations, a helper Bash script `sl` is provided in the `contrib/` directory. This script wraps the common `ssh` commands for `add`, `ls`, and `rm` operations on a remote `slink` server.
+
+**Features:**
+
+*   Provides `add`, `ls`, and `rm` subcommands mirroring `slink`.
+*   Handles piping local files to the remote `slink add` command.
+*   Configurable default remote server via an XDG-compliant config file (`~/.config/slink/config`).
+*   Prompts for server configuration using the `init` command if not already set.
+
+**Setup:**
+
+1.  **Configure:** Run `contrib/sl init` and enter the hostname of your remote server where `slink` is running. This saves the server name to `~/.config/slink/config`.
+2.  **(Optional) Install Locally:** Copy the `contrib/sl` script to a location in your `$PATH`, for example:
+    ```bash
+    sudo cp contrib/sl /usr/local/bin/sl
+    sudo chmod +x /usr/local/bin/sl
+    ```
+
+**Usage:**
+
+Once configured (and optionally installed), you can use the script like this:
+
+*   **Add & Share:**
+    ```bash
+    sl add local_document.pdf -s recipient@example.com [-n remote_name.pdf] [-h other.server.com]
+    # Uses server from ~/.config/slink/config unless -h is provided
+    ```
+*   **List Files:**
+    ```bash
+    sl ls [-h other.server.com]
+    ```
+*   **Remove File:**
+    ```bash
+    sl rm <filename_or_uuid> [-h other.server.com]
+    ```
+
+The script requires the `-h <host>` flag if the configuration file has not been created using `sl init`.
+
 ## Web Server Configuration
 
 Example nginx configuration:

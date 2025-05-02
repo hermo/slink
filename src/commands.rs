@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use crate::{create_dir_all, remove_file_with_access}; // Added remove_file_with_access
 use crate::{Config, FileShare, ShareInfo};
 use crate::Uuid;
+use uuid::Timestamp;
 use crate::{Permissions, PermissionsExt, set_permissions, set_permissions_recursive};
 use std::io::{self, Write, Read, BufReader, BufWriter};
 use std::collections::HashSet; // Added for cleanup logic
@@ -47,8 +48,8 @@ pub fn initialize_config() -> Result<()> {
         .to_string_lossy())?;
     let hash_secret = prompt_with_default("Hash secret (leave empty to generate)", "*generate*")?;
     let hash_secret = if hash_secret == "*generate*" || hash_secret.is_empty() {
-        // Generate a random password
-        Uuid::new_v4().to_string()
+        // Generate ID
+        Uuid::new_v7(Timestamp::now(uuid::NoContext)).to_string()
     } else {
         hash_secret
     };
@@ -160,7 +161,7 @@ pub async fn add_file(pool: &SqlitePool, config: &Config, file_path: &str, name:
         (path.clone(), calculate_file_hash(&path)?)
     };
 
-    let uuid = Uuid::new_v4().to_string();
+    let uuid = Uuid::new_v7(Timestamp::now(uuid::NoContext)).to_string();
     let target_dir = PathBuf::from(&config.base_dir).join(&uuid);
     let target_file = target_dir.join(&filename);
 
@@ -234,7 +235,7 @@ fn handle_stdin_upload(base_dir: &str, filename: &str) -> Result<(PathBuf, Strin
     let temp_path = temp_file.to_path_buf();
 
     // Rename with our prefix and the actual filename
-    let new_name = temp_dir.join(format!("slink_temp_{}_{}", Uuid::new_v4(), filename));
+    let new_name = temp_dir.join(format!("slink_temp_{}_{}", Uuid::new_v7(Timestamp::now(uuid::NoContext)), filename));
     fs::rename(&temp_path, &new_name)?;
 
     let file = fs::OpenOptions::new()

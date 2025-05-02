@@ -556,10 +556,13 @@ struct ExpiringShare {
 }
 
 // Made async, takes pool
-pub async fn cleanup_expired(pool: &SqlitePool, config: &Config) -> Result<()> {
+pub async fn cleanup_expired(pool: &SqlitePool, config: &Config, quiet: bool) -> Result<()> { // Added quiet flag
     let now = Utc::now();
     let now_naive = now.naive_utc(); // Use NaiveDateTime for DB comparison
-    println!("Running cleanup at {}...", now.format("%Y-%m-%d %H:%M:%S"));
+    if !quiet {
+        println!("Running cleanup at {}...", now.format("%Y-%m-%d %H:%M:%S"));
+    }
+    // Removed initial println! if quiet
 
     // 1. Find expired shares using sqlx
     let expired_shares = sqlx::query_as!(
@@ -580,19 +583,28 @@ pub async fn cleanup_expired(pool: &SqlitePool, config: &Config) -> Result<()> {
 
     for share in &expired_shares {
          expired_shares_count += 1;
-         println!(
-             "Found expired share for file {} (recipient: {}, expires: {})",
-             share.uuid, share.recipient, share.expires_at.map_or_else(|| "-".to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()) // Handle Option
-         );
+         // Suppress finding/marking messages if quiet
+         if !quiet {
+             println!(
+                 "Found expired share for file {} (recipient: {}, expires: {})",
+                 share.uuid, share.recipient, share.expires_at.map_or_else(|| "-".to_string(), |dt| dt.format("%Y-%m-%d %H:%M:%S").to_string()) // Handle Option
+             );
+         }
          if share.delete_file_on_expiry {
-             println!("  -> Marked file {} for deletion.", share.uuid);
+             // Suppress marking message if quiet
+             if !quiet {
+                 println!("  -> Marked file {} for deletion.", share.uuid);
+             }
              files_to_delete.insert(share.uuid.clone());
          }
     }
 
 
     if expired_shares.is_empty() && files_to_delete.is_empty() {
-        println!("No expired shares or files marked for deletion found.");
+        if !quiet {
+             // Suppress "nothing found" message if quiet
+             println!("No expired shares or files marked for deletion found.");
+        }
         return Ok(());
     }
 
@@ -606,6 +618,7 @@ pub async fn cleanup_expired(pool: &SqlitePool, config: &Config) -> Result<()> {
             if let Err(e) = fs::remove_file(&symlink_path) {
                 eprintln!("Warning: Failed to remove symlink {}: {}", symlink_path.display(), e);
                 // Log and continue
+                // Keep error messages even if quiet
             } else {
                 println!("Removed symlink: {}", symlink_path.display());
             }
@@ -619,7 +632,11 @@ pub async fn cleanup_expired(pool: &SqlitePool, config: &Config) -> Result<()> {
         )
         .execute(&mut *tx) // Execute within the transaction
         .await?;
-        println!("Deactivated share for file {} (recipient: {})", share.uuid, share.recipient);
+        // Suppress deactivation message if quiet
+        if !quiet {
+            println!("Deactivated share for file {} (recipient: {})", share.uuid, share.recipient);
+        }
+
     }
 
     // 3. Delete files marked for deletion (if any)
@@ -634,13 +651,17 @@ pub async fn cleanup_expired(pool: &SqlitePool, config: &Config) -> Result<()> {
         .await?;
 
         if active_shares_count == 0 {
-            println!("Proceeding with deletion of file {}", uuid_to_delete);
+            // Suppress "Proceeding" message if quiet
+            if !quiet {
+                println!("Proceeding with deletion of file {}", uuid_to_delete);
+            }
             let file_dir = PathBuf::from(&config.base_dir).join(uuid_to_delete);
 
             // Use remove_file_with_access for potentially permissioned files
             if file_dir.exists() { // Check if dir exists before trying to remove
                 if let Err(e) = remove_file_with_access(&file_dir) {
                      eprintln!("Error deleting file directory {}: {}", file_dir.display(), e);
+                     // Keep error messages even if quiet
                      // Log and continue, transaction will rollback on error if not committed
                 } else {
                      println!("Deleted file directory: {}", file_dir.display());
@@ -649,36 +670,56 @@ pub async fn cleanup_expired(pool: &SqlitePool, config: &Config) -> Result<()> {
                      sqlx::query!("DELETE FROM shares WHERE uuid = ?", uuid_to_delete)
                         .execute(&mut *tx)
                         .await?;
-                     println!("Removed associated shares for file {} from database.", uuid_to_delete);
+                     // Keep removal messages even if quiet
+                     println!("Removed associated shares record for file {} from database.", uuid_to_delete);
 
                      // Then, remove the file record from the 'files' table using sqlx
                      sqlx::query!("DELETE FROM files WHERE uuid = ?", uuid_to_delete)
                         .execute(&mut *tx) // Execute within the transaction
                         .await?;
+                     // Keep removal messages even if quiet
                      println!("Removed file record {} from database.", uuid_to_delete);
-                }
-            } else {
-                 println!("Warning: Directory {} not found, skipping deletion.", file_dir.display());
-                 // If directory doesn't exist, still try to remove DB record
-                 if let Err(e) = sqlx::query!("DELETE FROM files WHERE uuid = ?", uuid_to_delete)
-                    .execute(&mut *tx)
-                    .await {
-                     eprintln!("Error removing file record {} from database: {}", uuid_to_delete, e);
-                 } else {
-                     println!("Removed potentially orphaned file record {} from database.", uuid_to_delete);
-                 }
-            }
+                  }
+             } else {
+                  // Keep warning messages even if quiet
+                  println!("Warning: Directory {} not found, skipping deletion.", file_dir.display());
+                  // If directory doesn't exist, still try to remove DB record
+                  match sqlx::query!("DELETE FROM files WHERE uuid = ?", uuid_to_delete)
+                     .execute(&mut *tx)
+                     .await {
+                      Ok(result) if result.rows_affected() > 0 => {
+                          // Keep removal messages even if quiet
+                          println!("Removed potentially orphaned file record {} from database.", uuid_to_delete);
+                          // Suppress this message if quiet
+                          if !quiet {
+                              // This specific message is now redundant if the one above is always shown
+                              // println!("Removed potentially orphaned file record {} from database.", uuid_to_delete);
+                          }
+                      }
+                      Ok(_) => {} // No rows affected, record likely already gone
+                      // Keep error messages even if quiet
+                      Err(e) => eprintln!("Error removing file record {} from database: {}", uuid_to_delete, e),
+                  }
+             }
         } else {
-            println!(
-                "Skipping deletion of file {}: {} other active shares exist.",
-                uuid_to_delete, active_shares_count
-            );
+            if !quiet {
+                println!(
+                    "Skipping deletion of file {}: {} other active shares exist.",
+                    // Suppress skipping message if quiet
+                    uuid_to_delete, active_shares_count
+                );
+            }
         }
+
     }
 
     // Commit transaction
     tx.commit().await?; // Commit async transaction
 
-    println!("Cleanup finished. Expired shares processed: {}. Files deleted: {}.", expired_shares_count, files_deleted_count);
+    if !quiet {
+         println!("Cleanup finished. Expired shares processed: {}. Files deleted: {}.", expired_shares_count, files_deleted_count);
+         // Suppress final summary if quiet
+    }
     Ok(())
+
 }

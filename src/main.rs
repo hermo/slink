@@ -103,7 +103,10 @@ enum Opt {
     #[structopt(name = "info")]
     Info,
     #[structopt(name = "cleanup", about = "Clean up expired shares and optionally files")]
-    Cleanup,
+    Cleanup {
+        #[structopt(short = "q", long = "quiet", help = "Suppress output except when removing files")]
+        quiet: bool,
+    },
 }
 
 #[derive(FromRow, Debug)] // Added Debug
@@ -510,9 +513,9 @@ async fn main() -> Result<()> { // Added async back
              // Call async command function
              commands::show_info(&pool, &config).await?;
         }
-        Opt::Cleanup => {
+        Opt::Cleanup { quiet } => {
             // Call async command function
-            commands::cleanup_expired(&pool, &config).await?;
+            commands::cleanup_expired(&pool, &config, quiet).await?;
         }
         Opt::Init => unreachable!(), // Already handled
     }

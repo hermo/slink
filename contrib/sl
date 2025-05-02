@@ -111,9 +111,8 @@ do_add() {
   shift $((OPTIND-1))
   local_file="$1"
 
-  # Ensure server is set
-  ensure_server_set "$host_override" "add"
-
+# Ensure server is set
+ensure_server_set "$host_override" "add"
   # Validation for 'add'
   if [[ -z "$recipient" || -z "$local_file" ]]; then
     echo "Error: For 'add', recipient (-s) and local file path are required." >&2
@@ -236,17 +235,21 @@ if [[ "$1" == "init" ]]; then
 fi
 
 
-# Determine command (default to 'add' if first arg doesn't match known commands and isn't an option)
+# Determine command
 if [[ "$1" == "ls" || "$1" == "rm" ]]; then
   COMMAND="$1"
   shift # Remove command from arguments
-elif [[ "$1" =~ ^- ]] || [[ -n "$1" && "$1" != "ls" && "$1" != "rm" ]]; then
-  # First arg is an option OR it's not ls/rm/init -> assume 'add'
-  # We don't shift here because the first arg might be the filename for add
+elif [[ "$1" == "add" ]]; then
   COMMAND="add"
+  shift # Explicitly shift 'add' command
+elif [[ -n "$1" && ! "$1" =~ ^- ]]; then
+  # Argument exists, is not ls/rm/add, and doesn't start with - -> Invalid command
+  echo "Error: Unknown command '$1'" >&2
+  usage
 else
-    # If it's not init, ls, rm, or looks like args for add, it's an error
-    usage
+  # First argument starts with - OR no arguments left after potential shift
+  # Assume implicit 'add'
+  COMMAND="add"
 fi
 
 

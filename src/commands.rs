@@ -645,7 +645,13 @@ pub async fn cleanup_expired(pool: &SqlitePool, config: &Config) -> Result<()> {
                 } else {
                      println!("Deleted file directory: {}", file_dir.display());
                      files_deleted_count += 1;
-                     // Also remove the file record from the 'files' table using sqlx
+                     // First, remove all associated shares for this file
+                     sqlx::query!("DELETE FROM shares WHERE uuid = ?", uuid_to_delete)
+                        .execute(&mut *tx)
+                        .await?;
+                     println!("Removed associated shares for file {} from database.", uuid_to_delete);
+
+                     // Then, remove the file record from the 'files' table using sqlx
                      sqlx::query!("DELETE FROM files WHERE uuid = ?", uuid_to_delete)
                         .execute(&mut *tx) // Execute within the transaction
                         .await?;

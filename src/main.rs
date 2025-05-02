@@ -58,6 +58,7 @@ enum Opt {
 
         #[structopt(
             long,
+            short = "d",
             help = "Delete file when the initial share expires (requires -s/--share and --expires-in)",
             requires = "share" // Only relevant if -s is used
         )]
@@ -77,6 +78,7 @@ enum Opt {
 
         #[structopt(
             long,
+            short = "d",
             help = "Delete the file when this share expires (requires --expires-in)"
         )]
         delete_file_on_expiry: bool,
@@ -325,6 +327,12 @@ impl FileShare {
         .execute(pool)
         .await?;
 
+        // First, delete all associated shares for this file
+        sqlx::query!("DELETE FROM shares WHERE uuid = ?", self.uuid)
+            .execute(pool)
+            .await?;
+
+        // Then, delete the file record
         sqlx::query!("DELETE FROM files WHERE uuid = ?", self.uuid)
             .execute(pool)
             .await?;
@@ -427,15 +435,10 @@ async fn main() -> Result<()> { // Added async back
     // For all other commands, load the configuration and establish DB pool
     let (config, pool) = Config::load_config_and_pool().await?; // Use new async function
 
-    // --- Run Migrations ---
-    println!("Applying database migrations...");
     sqlx::migrate!("./migrations") // Point to the migrations directory
         .run(&pool)
         .await
         .map_err(|e| anyhow!("Database migration failed: {}", e))?;
-    println!("Migrations applied successfully.");
-    // --- End Migrations ---
-
 
     // Match and execute other commands (now async)
     match opt {
